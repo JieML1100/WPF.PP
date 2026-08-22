@@ -141,6 +141,7 @@ public:
 
 private:
 	friend class ItemsControl;
+	friend class DataGrid;
 	ControlWeakReference _logicalScrollContent;
 	static const DependencyPropertyKey& ExtentWidthPropertyKey();
 	static const DependencyPropertyKey& ExtentHeightPropertyKey();
@@ -151,6 +152,7 @@ private:
 
 	bool _draggingVerticalScrollBar = false;
 	bool _draggingHorizontalScrollBar = false;
+	bool _lastScrollChangeWasInteractive = false;
 	float _verticalScrollThumbGrabOffset = 0.0f;
 	float _horizontalScrollThumbGrabOffset = 0.0f;
 
@@ -158,7 +160,9 @@ private:
 	ScrollLayout CalcScrollLayout();
 	cui::core::Size MeasureContentSizeDip();
 	void ClampScrollOffsets(const ScrollLayout& layout);
-	void SetScrollOffsetCore(double horizontalOffset, double verticalOffset);
+	void SetScrollOffsetCore(
+		double horizontalOffset, double verticalOffset,
+		bool interactive = false);
 	void PublishScrollState(
 		const ScrollLayout& layout,
 		double horizontalOffset,

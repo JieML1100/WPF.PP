@@ -1142,6 +1142,70 @@ namespace
 			if (++_configurationRevision == 0) ++_configurationRevision;
 			return true;
 		}
+		bool UpdatePersistentItemExtent(
+			size_t index, double extent, size_t revision) noexcept
+		{
+			if (index >= _itemCount || !std::isfinite(extent) || extent < 0.0)
+				return false;
+			const double nextDelta = extent - static_cast<double>(_itemHeight);
+			auto found = std::lower_bound(
+				_persistentItemExtentDeltas.begin(),
+				_persistentItemExtentDeltas.end(), index,
+				[](const PersistentItemExtentDelta& item, size_t itemIndex)
+				{ return item.ItemIndex < itemIndex; });
+			const double previousDelta = found != _persistentItemExtentDeltas.end()
+				&& found->ItemIndex == index ? found->Delta : 0.0;
+			if (std::abs(previousDelta - nextDelta) <= 0.0001)
+			{
+				_itemExtentOverrideRevision = revision;
+				return true;
+			}
+			const size_t position = static_cast<size_t>(std::distance(
+				_persistentItemExtentDeltas.begin(), found));
+			if (std::abs(nextDelta) <= 0.0001)
+			{
+				if (found != _persistentItemExtentDeltas.end()
+					&& found->ItemIndex == index)
+					_persistentItemExtentDeltas.erase(found);
+			}
+			else if (found != _persistentItemExtentDeltas.end()
+				&& found->ItemIndex == index)
+				found->Delta = nextDelta;
+			else
+				_persistentItemExtentDeltas.insert(found,
+					PersistentItemExtentDelta{ index, nextDelta, 0.0 });
+
+			const double change = nextDelta - previousDelta;
+			_persistentItemExtentTotal = SaturatingSignedAdd(
+				_persistentItemExtentTotal, change);
+			_contentHeight = SaturatingDipAdjust(_contentHeight, change);
+			double before = position == 0 ? 0.0
+				: SaturatingSignedAdd(
+					_persistentItemExtentDeltas[position - 1].DeltaBefore,
+					_persistentItemExtentDeltas[position - 1].Delta);
+			for (size_t item = position;
+				item < _persistentItemExtentDeltas.size(); ++item)
+			{
+				_persistentItemExtentDeltas[item].DeltaBefore = before;
+				before = SaturatingSignedAdd(
+					before, _persistentItemExtentDeltas[item].Delta);
+			}
+			for (auto& header : _groupHeaders)
+			{
+				if (header.ItemIndex > index)
+				{
+					header.ItemTop = SaturatingDipAdjust(header.ItemTop, change);
+					header.ItemEnd = SaturatingDipAdjust(header.ItemEnd, change);
+				}
+				else if (header.ItemIndex == index)
+					header.ItemEnd = SaturatingDipAdjust(header.ItemEnd, change);
+			}
+			_itemExtentOverrideRevision = revision;
+			RebuildMeasuredItemExtents();
+			if (++_configurationRevision == 0) ++_configurationRevision;
+			InvalidateLayout();
+			return true;
+		}
 		size_t IndexAtOffset(double offset) const noexcept
 		{
 			if (_itemCount == 0) return 0;
@@ -2389,6 +2453,30 @@ void ItemsControl::ConfigureVirtualHost()
 		host->SynchronizeAuthoredItems(_authoredItems);
 }
 
+bool ItemsControl::TryUpdateVirtualizedItemExtentOverride(
+	size_t itemIndex, double extent)
+{
+	auto* host = dynamic_cast<VirtualizingItemsHost*>(_itemsHost);
+	return host && host->UpdatePersistentItemExtent(
+		itemIndex, extent, GetVirtualizedItemExtentOverridesRevision());
+}
+
+bool ItemsControl::IsVirtualizedItemInViewport(size_t itemIndex) const noexcept
+{
+	if (!IsVirtualizing()) return true;
+	const auto* host = dynamic_cast<const VirtualizingItemsHost*>(_itemsHost);
+	auto* scroll = ItemsScrollOwner();
+	if (!host || !scroll || itemIndex >= ItemCount()) return false;
+	const auto size = scroll->GetActualSizeDip();
+	const double viewport = std::isfinite(size.height)
+		? (std::max)(1.0, static_cast<double>(size.height)) : 1.0;
+	const double offset = std::isfinite(scroll->VerticalOffset)
+		? (std::max)(0.0, scroll->VerticalOffset) : 0.0;
+	const double top = host->ItemTop(itemIndex);
+	const double bottom = SaturatingDipAdd(top, host->ItemExtent(itemIndex));
+	return bottom > offset + 0.0001 && top < offset + viewport - 0.0001;
+}
+
 size_t ItemsControl::VirtualOffsetMetadataEntryCount() const noexcept
 {
 	const auto* host = dynamic_cast<const VirtualizingItemsHost*>(_itemsHost);
@@ -2693,8 +2781,18 @@ void ItemsControl::RefreshItemsScrollOwner()
 		_scrollChanged = _itemsScrollOwner->OnScrollChanged.Subscribe(
 			[this](Control*, ScrollChangedEventArgs&)
 			{
-				if (IsVirtualizing() && !_applyingCollectionChange)
-					(void)RealizeVirtualViewport(true);
+				if (!IsVirtualizing() || _applyingCollectionChange) return;
+				// A native wheel/thumb burst can publish many offsets before the
+				// retained scene presents one frame.  Presented controls consume only
+				// the newest range from PreparePresentation; detached controls keep
+				// synchronous realization for deterministic programmatic use/tests.
+				if (GetPresentationWindow() && _itemsScrollOwner
+					&& _itemsScrollOwner->_lastScrollChangeWasInteractive)
+				{
+					_virtualRealizationPending = true;
+					return;
+				}
+				(void)RealizeVirtualViewport(true);
 			});
 	}
 }
@@ -5186,11 +5284,13 @@ bool ItemsControl::RealizeVirtualRange(
 		if (auto* owner = dynamic_cast<ItemsControl*>(ownerLifetime.Get()))
 			owner->_realizingViewport = false;
 	});
-	std::vector<CrossIndexRecycleCandidate> recycleCandidates;
+	auto& recycleCandidates = _virtualRecycleCandidatesScratch;
+	recycleCandidates.clear();
 	recycleCandidates.reserve(_generator.RecycledItems().size());
 	for (const auto& [index, item] : _generator.RecycledItems())
 		recycleCandidates.push_back({ index, item.Visual.get() });
-	std::vector<size_t> additionIndices;
+	auto& additionIndices = _virtualAdditionIndicesScratch;
+	additionIndices.clear();
 	additionIndices.reserve(last - first);
 	for (size_t index = first; index < last; ++index)
 		if (!_generator.ContainsRealized(index))
@@ -5241,7 +5341,9 @@ bool ItemsControl::RealizeVirtualRange(
 		additions.push_back(std::move(item));
 	}
 
-	std::vector<size_t> removals;
+	auto& removals = _virtualRemovalIndicesScratch;
+	removals.clear();
+	removals.reserve(_generator.RealizedCount());
 	for (const auto& [index, item] : _generator.RealizedItems())
 	{
 		(void)item;
@@ -5306,11 +5408,83 @@ bool ItemsControl::RealizeVirtualRange(
 	return ownerLifetime.Get() != nullptr;
 }
 
-bool ItemsControl::RealizeVirtualViewport(bool localLayoutForScroll)
+bool ItemsControl::RealizeVirtualViewport(
+	bool localLayoutForScroll, bool useVisibleOnlyRange)
 {
 	if (!IsVirtualizing()) return true;
-	const auto [first, last] = VirtualRangeForViewport();
-	return RealizeVirtualRange(first, last, localLayoutForScroll);
+	auto [first, last] = VirtualRangeForViewport();
+	auto* scroll = ItemsScrollOwner();
+	auto* host = dynamic_cast<VirtualizingItemsHost*>(_itemsHost);
+	const auto& panel = EffectiveItemsPanel();
+	const auto& realized = _generator.RealizedItems();
+	const size_t count = ItemCount();
+	if (useVisibleOnlyRange && scroll && host)
+	{
+		const auto size = scroll->GetActualSizeDip();
+		const double viewport = std::isfinite(size.height)
+			? (std::max)(1.0, static_cast<double>(size.height)) : 1.0;
+		const double contentHeight = host->ContentHeight();
+		const double offset = std::isfinite(scroll->VerticalOffset)
+			? (std::clamp)(scroll->VerticalOffset, 0.0, contentHeight) : 0.0;
+		const double visibleEndOffset = (std::min)(
+			contentHeight, offset + viewport);
+		first = host->IndexAtOffset(offset);
+		last = visibleEndOffset >= contentHeight
+			? count : (std::min)(count,
+				host->IndexAtOffset(visibleEndOffset) + 1);
+	}
+	const bool canStabilize = scroll && host && !realized.empty()
+		&& !useVisibleOnlyRange && !scroll->_draggingVerticalScrollBar
+		&& panel.CacheLength > 0.0f;
+	if (canStabilize)
+	{
+		const size_t currentFirst = realized.begin()->first;
+		const size_t currentLast = realized.rbegin()->first + 1;
+		const bool contiguous = currentLast <= count
+			&& realized.size() == currentLast - currentFirst;
+		const auto size = scroll->GetActualSizeDip();
+		const double viewport = std::isfinite(size.height)
+			? (std::max)(1.0, static_cast<double>(size.height)) : 1.0;
+		const double contentHeight = host->ContentHeight();
+		const double offset = std::isfinite(scroll->VerticalOffset)
+			? (std::clamp)(scroll->VerticalOffset, 0.0, contentHeight) : 0.0;
+		const double visibleEndOffset = (std::min)(
+			contentHeight, offset + viewport);
+		const size_t visibleFirst = host->IndexAtOffset(offset);
+		const size_t visibleLast = visibleEndOffset >= contentHeight
+			? count : (std::min)(count,
+				host->IndexAtOffset(visibleEndOffset) + 1);
+		if (contiguous && currentFirst <= visibleFirst
+			&& currentLast >= visibleLast)
+		{
+			const double currentTop = currentFirst < count
+				? host->ItemTop(currentFirst) : contentHeight;
+			const double currentBottom = currentLast == 0
+				? 0.0 : host->ItemTop(currentLast - 1)
+					+ host->ItemExtent(currentLast - 1);
+			const double guard = static_cast<double>(panel.CacheLength)
+				* viewport * 0.35;
+			const double delta = std::isfinite(_lastVirtualRealizationOffset)
+				? offset - _lastVirtualRealizationOffset : 0.0;
+			const bool forwardCovered = currentBottom - visibleEndOffset
+				> guard && currentTop <= offset + 0.0001;
+			const bool backwardCovered = offset - currentTop > guard
+				&& currentBottom + 0.0001 >= visibleEndOffset;
+			// Retire the trailing side at the exact cache boundary so stale
+			// containers cannot accumulate.  Only the leading side gets hysteresis:
+			// this batches expensive generation while keeping memory and UIA state
+			// as precise as the pre-hysteresis viewport contract.
+			if (delta > 0.0001 && forwardCovered)
+				last = currentLast;
+			else if (delta < -0.0001 && backwardCovered)
+				first = currentFirst;
+		}
+	}
+	const bool realizedRange = RealizeVirtualRange(
+		first, last, localLayoutForScroll);
+	if (realizedRange && scroll)
+		_lastVirtualRealizationOffset = scroll->VerticalOffset;
+	return realizedRange;
 }
 
 void ItemsControl::RestoreVirtualCacheAfterVerticalThumbDrag()
@@ -6068,7 +6242,12 @@ void ItemsControl::PreparePresentation()
 		const bool restoring = _virtualCacheRestorePending
 			&& !_realizingViewport && !_applyingCollectionChange
 			&& !IsItemsSourceUpdateInProgress();
-		const bool realized = RealizeVirtualViewport();
+		const bool interactiveViewport = _itemsScrollOwner
+			&& _itemsScrollOwner->_lastScrollChangeWasInteractive;
+		const bool realized = RealizeVirtualViewport(
+			_virtualRealizationPending || interactiveViewport,
+			_virtualRealizationPending || interactiveViewport);
+		if (realized) _virtualRealizationPending = false;
 		if (restoring)
 		{
 			if (realized) _virtualCacheRestorePending = false;

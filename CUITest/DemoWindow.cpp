@@ -388,6 +388,7 @@ namespace
 			default:
 				return false;
 			}
+			ApplyModifiedSortOverrides(next, columnIndex, direction, _cache);
 			_sort = std::move(next);
 			const CollectionChangedEventArgs change{
 				CollectionChangeAction::Reset,
@@ -410,18 +411,35 @@ namespace
 		{
 			mutable std::unordered_map<
 				size_t, std::weak_ptr<ObservableObject>> Items;
+			// Generated rows remain weak so scrolling never becomes a million-object
+			// cache.  A user edit promotes only that source occurrence to a strong,
+			// sparse override which both snapshots and source-side sorting can see.
+			mutable std::unordered_map<
+				size_t, std::shared_ptr<ObservableObject>> ModifiedItems;
+			mutable std::unordered_map<size_t, EventConnection> Observations;
 		};
 
 		struct SortPlan final
 		{
+			struct OverridePlacement final
+			{
+				size_t SourceIndex = 0;
+				size_t InsertionRank = 0;
+				size_t FinalPosition = 0;
+			};
+
 			bool Reverse = false;
 			size_t Period = 0;
 			std::vector<std::vector<size_t>> Buckets;
 			std::vector<size_t> Starts;
 			std::vector<size_t> ResidueBucket;
 			std::vector<size_t> ResiduePosition;
+			std::vector<size_t> RemovedBasePositions;
+			std::vector<OverridePlacement> OverridesByFinal;
+			std::vector<std::pair<size_t, size_t>> OverrideSourceToFinal;
+			std::vector<size_t> OverrideInsertionRanks;
 
-			size_t ViewToSource(size_t index) const noexcept
+			size_t BaseViewToSource(size_t index) const noexcept
 			{
 				if (Period == 0) return Reverse ? RowCount - 1 - index : index;
 				const auto upper = std::upper_bound(
@@ -436,13 +454,67 @@ namespace
 					+ residues[local % residues.size()];
 			}
 
-			size_t SourceToView(size_t index) const noexcept
+			size_t BaseSourceToView(size_t index) const noexcept
 			{
 				if (Period == 0) return Reverse ? RowCount - 1 - index : index;
 				const size_t residue = index % Period;
 				const size_t bucket = ResidueBucket[residue];
 				return Starts[bucket] + (index / Period)
 					* Buckets[bucket].size() + ResiduePosition[residue];
+			}
+
+			size_t ViewToSource(size_t index) const noexcept
+			{
+				if (index >= RowCount) return (std::numeric_limits<size_t>::max)();
+				if (OverridesByFinal.empty()) return BaseViewToSource(index);
+				const auto override = std::lower_bound(
+					OverridesByFinal.begin(), OverridesByFinal.end(), index,
+					[](const OverridePlacement& candidate, size_t position)
+					{ return candidate.FinalPosition < position; });
+				if (override != OverridesByFinal.end()
+					&& override->FinalPosition == index)
+					return override->SourceIndex;
+				const size_t insertedBefore = static_cast<size_t>(std::distance(
+					OverridesByFinal.begin(), override));
+				const size_t nonOverrideRank = index - insertedBefore;
+				size_t low = 0;
+				size_t high = RowCount;
+				while (low < high)
+				{
+					const size_t middle = low + (high - low) / 2;
+					const size_t removedThrough = static_cast<size_t>(std::distance(
+						RemovedBasePositions.begin(),
+						std::upper_bound(RemovedBasePositions.begin(),
+							RemovedBasePositions.end(), middle)));
+					const size_t retainedThrough = middle + 1 - removedThrough;
+					if (retainedThrough > nonOverrideRank) high = middle;
+					else low = middle + 1;
+				}
+				return low < RowCount ? BaseViewToSource(low)
+					: (std::numeric_limits<size_t>::max)();
+			}
+
+			size_t SourceToView(size_t index) const noexcept
+			{
+				if (index >= RowCount) return (std::numeric_limits<size_t>::max)();
+				if (OverrideSourceToFinal.empty()) return BaseSourceToView(index);
+				const auto override = std::lower_bound(
+					OverrideSourceToFinal.begin(), OverrideSourceToFinal.end(), index,
+					[](const auto& candidate, size_t sourceIndex)
+					{ return candidate.first < sourceIndex; });
+				if (override != OverrideSourceToFinal.end()
+					&& override->first == index) return override->second;
+				const size_t basePosition = BaseSourceToView(index);
+				const size_t removedBefore = static_cast<size_t>(std::distance(
+					RemovedBasePositions.begin(),
+					std::lower_bound(RemovedBasePositions.begin(),
+						RemovedBasePositions.end(), basePosition)));
+				const size_t nonOverrideRank = basePosition - removedBefore;
+				const size_t insertedBefore = static_cast<size_t>(std::distance(
+					OverrideInsertionRanks.begin(),
+					std::upper_bound(OverrideInsertionRanks.begin(),
+						OverrideInsertionRanks.end(), nonOverrideRank)));
+				return nonOverrideRank + insertedBefore;
 			}
 
 			static SortPlan PeriodicStrings(
@@ -531,6 +603,187 @@ namespace
 			}
 		};
 
+		static BindingValue DefaultSortKey(
+			size_t columnIndex, size_t sourceIndex)
+		{
+			static constexpr const wchar_t* regions[] =
+			{
+				L"华东", L"华南", L"华北", L"华中",
+				L"西南", L"西北", L"东北"
+			};
+			static constexpr const wchar_t* stages[] =
+			{
+				L"待确认", L"生产中", L"备货中",
+				L"已发货", L"待付款", L"已完成"
+			};
+			const auto number = static_cast<unsigned long long>(sourceIndex + 1);
+			switch (columnIndex)
+			{
+			case 0:
+				return BindingValue(StringHelper::Format(
+					L"LOAD-%07llu", number));
+			case 1:
+				return BindingValue(StringHelper::Format(
+					L"压力客户 %07llu", number));
+			case 2:
+				return BindingValue(std::wstring(
+					regions[sourceIndex % std::size(regions)]));
+			case 3:
+				return BindingValue(std::wstring(
+					stages[sourceIndex % std::size(stages)]));
+			case 4:
+				return BindingValue(static_cast<int>(sourceIndex % 48) + 1);
+			case 5:
+				return BindingValue(static_cast<long long>(
+					8'000 + (sourceIndex % 9'500) * 37));
+			case 6:
+				return BindingValue(sourceIndex % 3 != 0);
+			default:
+				return {};
+			}
+		}
+
+		static BindingSourcePropertyToken SortPropertyToken(size_t columnIndex)
+		{
+			static const BindingSourcePropertyToken tokens[] =
+			{
+				MakeBindingSourcePropertyToken(L"OrderNo"),
+				MakeBindingSourcePropertyToken(L"Customer"),
+				MakeBindingSourcePropertyToken(L"Region"),
+				MakeBindingSourcePropertyToken(L"Stage"),
+				MakeBindingSourcePropertyToken(L"Quantity"),
+				MakeBindingSourcePropertyToken(L"Amount"),
+				MakeBindingSourcePropertyToken(L"Paid")
+			};
+			return columnIndex < std::size(tokens)
+				? tokens[columnIndex] : BindingSourcePropertyToken{};
+		}
+
+		static int CompareSortKeys(
+			size_t columnIndex,
+			const BindingValue& left,
+			const BindingValue& right)
+		{
+			if (columnIndex <= 3)
+			{
+				const auto leftText = left.ToString();
+				const auto rightText = right.ToString();
+				const int compared = ::CompareStringOrdinal(
+					leftText.c_str(), -1, rightText.c_str(), -1, TRUE);
+				return compared == CSTR_LESS_THAN ? -1
+					: compared == CSTR_GREATER_THAN ? 1 : 0;
+			}
+			if (columnIndex == 6)
+			{
+				bool leftValue = false;
+				bool rightValue = false;
+				(void)left.TryGet(leftValue);
+				(void)right.TryGet(rightValue);
+				return leftValue < rightValue ? -1
+					: leftValue > rightValue ? 1 : 0;
+			}
+			long long leftValue = 0;
+			long long rightValue = 0;
+			(void)left.TryGet(leftValue);
+			(void)right.TryGet(rightValue);
+			return leftValue < rightValue ? -1
+				: leftValue > rightValue ? 1 : 0;
+		}
+
+		static bool SortsBefore(
+			size_t columnIndex,
+			const BindingValue& leftKey, size_t leftSource,
+			const BindingValue& rightKey, size_t rightSource,
+			CollectionSortDirection direction)
+		{
+			const int compared = CompareSortKeys(columnIndex, leftKey, rightKey);
+			if (compared == 0) return leftSource < rightSource;
+			return direction == CollectionSortDirection::Ascending
+				? compared < 0 : compared > 0;
+		}
+
+		static void ApplyModifiedSortOverrides(
+			SortPlan& plan,
+			size_t columnIndex,
+			CollectionSortDirection direction,
+			const std::shared_ptr<MaterializedCache>& cache)
+		{
+			if (!cache || cache->ModifiedItems.empty()) return;
+			struct Candidate final
+			{
+				size_t SourceIndex = 0;
+				BindingValue Key;
+				size_t InsertionRank = 0;
+				size_t FinalPosition = 0;
+			};
+			std::vector<Candidate> candidates;
+			candidates.reserve(cache->ModifiedItems.size());
+			const auto token = SortPropertyToken(columnIndex);
+			for (const auto& [sourceIndex, item] : cache->ModifiedItems)
+			{
+				if (sourceIndex >= RowCount || !item) continue;
+				BindingValue key;
+				if (!token || !item->TryGetValue(token, key))
+					key = DefaultSortKey(columnIndex, sourceIndex);
+				candidates.push_back({ sourceIndex, std::move(key) });
+			}
+			if (candidates.empty()) return;
+
+			plan.RemovedBasePositions.reserve(candidates.size());
+			for (const auto& candidate : candidates)
+				plan.RemovedBasePositions.push_back(
+					plan.BaseSourceToView(candidate.SourceIndex));
+			std::sort(plan.RemovedBasePositions.begin(),
+				plan.RemovedBasePositions.end());
+			std::sort(candidates.begin(), candidates.end(),
+				[&](const Candidate& left, const Candidate& right)
+				{
+					return SortsBefore(columnIndex,
+						left.Key, left.SourceIndex,
+						right.Key, right.SourceIndex, direction);
+				});
+			for (size_t ordinal = 0; ordinal < candidates.size(); ++ordinal)
+			{
+				auto& candidate = candidates[ordinal];
+				size_t low = 0;
+				size_t high = RowCount;
+				while (low < high)
+				{
+					const size_t middle = low + (high - low) / 2;
+					const size_t baseSource = plan.BaseViewToSource(middle);
+					const auto baseKey = DefaultSortKey(columnIndex, baseSource);
+					if (SortsBefore(columnIndex,
+						baseKey, baseSource,
+						candidate.Key, candidate.SourceIndex, direction))
+						low = middle + 1;
+					else high = middle;
+				}
+				const size_t removedBefore = static_cast<size_t>(std::distance(
+					plan.RemovedBasePositions.begin(),
+					std::lower_bound(plan.RemovedBasePositions.begin(),
+						plan.RemovedBasePositions.end(), low)));
+				candidate.InsertionRank = low - removedBefore;
+				candidate.FinalPosition = candidate.InsertionRank + ordinal;
+			}
+
+			plan.OverridesByFinal.reserve(candidates.size());
+			plan.OverrideSourceToFinal.reserve(candidates.size());
+			plan.OverrideInsertionRanks.reserve(candidates.size());
+			for (const auto& candidate : candidates)
+			{
+				plan.OverridesByFinal.push_back({
+					candidate.SourceIndex,
+					candidate.InsertionRank,
+					candidate.FinalPosition });
+				plan.OverrideSourceToFinal.emplace_back(
+					candidate.SourceIndex, candidate.FinalPosition);
+				plan.OverrideInsertionRanks.push_back(
+					candidate.InsertionRank);
+			}
+			std::sort(plan.OverrideSourceToFinal.begin(),
+				plan.OverrideSourceToFinal.end());
+		}
+
 		class StableSnapshot final
 			: public IBindingList,
 			  public IBindingListOccurrenceIdentity,
@@ -599,24 +852,53 @@ namespace
 		{
 			out = {};
 			if (!cache || sourceIndex >= RowCount) return false;
-			auto found = cache->Items.find(sourceIndex);
-			auto item = found == cache->Items.end()
-				? std::shared_ptr<ObservableObject>{}
-				: found->second.lock();
+			auto modified = cache->ModifiedItems.find(sourceIndex);
+			auto item = modified == cache->ModifiedItems.end()
+				? std::shared_ptr<ObservableObject>{} : modified->second;
+			if (!item)
+			{
+				auto found = cache->Items.find(sourceIndex);
+				item = found == cache->Items.end()
+					? std::shared_ptr<ObservableObject>{}
+					: found->second.lock();
+			}
 			if (!item)
 			{
 				item = CreateItem(sourceIndex);
 				if (!item) return false;
 				cache->Items[sourceIndex] = item;
+				const std::weak_ptr<MaterializedCache> weakCache = cache;
+				const std::weak_ptr<ObservableObject> weakItem = item;
+				auto observation = item->PropertyChanged().Subscribe(
+					[weakCache, weakItem, sourceIndex](
+						const PropertyChangedEventArgs&)
+					{
+						auto liveCache = weakCache.lock();
+						auto liveItem = weakItem.lock();
+						if (!liveCache || !liveItem) return;
+						const auto found = liveCache->Items.find(sourceIndex);
+						if (found == liveCache->Items.end()
+							|| found->second.lock() != liveItem) return;
+						liveCache->ModifiedItems[sourceIndex] =
+							std::move(liveItem);
+					});
+				cache->Observations.insert_or_assign(
+					sourceIndex, std::move(observation));
 				// Row containers and bindings retain every item that can still be
 				// observed. Retire dead weak entries so a long manual scroll does not
 				// turn this demo source into an accidental million-key cache.
 				if (cache->Items.size() > 4096)
 					for (auto candidate = cache->Items.begin();
 						candidate != cache->Items.end();)
-						candidate = candidate->second.expired()
-							? cache->Items.erase(candidate)
-							: std::next(candidate);
+					{
+						if (!candidate->second.expired())
+						{
+							++candidate;
+							continue;
+						}
+						cache->Observations.erase(candidate->first);
+						candidate = cache->Items.erase(candidate);
+					}
 			}
 			out = BindingSourceReference(std::move(item));
 			return true;
@@ -6765,6 +7047,42 @@ bool DemoWindow::VerifyRuntimeDataFeatures(std::wstring* outError)
 		if (enforceMillionRowPerformanceBudget && sortElapsed >= 1'500.0)
 			return fail(L"DataGrid 百万行源端排序超出稀疏预算："
 				+ std::to_wstring(sortElapsed) + L" ms。");
+
+		auto* customerColumn = grid->GetColumn(1);
+		BindingSourceReference editedZero;
+		BindingSourceReference editedOne;
+		const auto customerToken =
+			MakeBindingSourcePropertyToken(L"Customer");
+		if (!customerColumn
+			|| !grid->GetItemsSource().Get()->TryGetItem(1, editedZero)
+			|| !grid->GetItemsSource().Get()->TryGetItem(2, editedOne)
+			|| !editedZero || !editedOne
+			|| !editedZero.Get()->TrySetValue(
+				customerToken, BindingValue(L"0"))
+			|| !editedOne.Get()->TrySetValue(
+				customerToken, BindingValue(L"1")))
+			return fail(L"DataGrid 百万行编辑后排序验证无法写回 Customer。");
+		editedZero = {};
+		editedOne = {};
+		auto customerAt = [&](size_t index)
+		{
+			BindingSourceReference item;
+			BindingValue value;
+			return grid->GetItemsSource().Get()->TryGetItem(index, item)
+				&& item && item.Get()->TryGetValue(customerToken, value)
+				? value.ToString() : std::wstring{};
+		};
+		if (!grid->PerformSort(*customerColumn, false)
+			|| customerColumn->GetSortDirection()
+				!= CollectionSortDirection::Ascending
+			|| customerAt(0) != L"0" || customerAt(1) != L"1")
+			return fail(L"DataGrid 百万行升序仍使用编辑前的 Customer 值。");
+		if (!grid->PerformSort(*customerColumn, false)
+			|| customerColumn->GetSortDirection()
+				!= CollectionSortDirection::Descending
+			|| customerAt(MillionOrderList::RowCount - 2) != L"1"
+			|| customerAt(MillionOrderList::RowCount - 1) != L"0")
+			return fail(L"DataGrid 百万行降序仍使用编辑前的 Customer 值。");
 		if (!millionButton->Invoke()
 			|| !grid->GetItemsSource()
 			|| grid->GetItemsSource().Get()->Count() != 18

@@ -1014,6 +1014,14 @@ private:
 class DataGridCellsPresenter final : public Panel
 {
 private:
+	struct CellSnapshot final
+	{
+		ControlWeakReference Lifetime;
+		DataGridCell* Identity = nullptr;
+		float Left = 0.0f;
+		float Width = 0.0f;
+	};
+
 	class CellsLayoutEngine final : public LayoutEngine
 	{
 	public:
@@ -1081,14 +1089,26 @@ private:
 				_needsLayout = false;
 				return { totalWidth, desiredHeight };
 			}
-			struct CellSnapshot final
+			std::vector<CellSnapshot> localCells;
+			const bool sharedScratch = !presenter->_layoutScratchInUse;
+			if (sharedScratch)
 			{
-				ControlWeakReference Lifetime;
-				DataGridCell* Identity = nullptr;
-				float Left = 0.0f;
-				float Width = 0.0f;
-			};
-			std::vector<CellSnapshot> cells;
+				presenter->_layoutScratchInUse = true;
+				presenter->_layoutScratch.clear();
+			}
+			auto scratchGuard = MakeScopeExit(
+				[presenterLifetime, sharedScratch]
+				{
+					if (!sharedScratch) return;
+					if (auto* live = dynamic_cast<DataGridCellsPresenter*>(
+						presenterLifetime.Get()))
+					{
+						live->_layoutScratch.clear();
+						live->_layoutScratchInUse = false;
+					}
+				});
+			auto& cells = sharedScratch
+				? presenter->_layoutScratch : localCells;
 			const int childCount = context.ChildCount();
 			cells.reserve(static_cast<size_t>((std::max)(0, childCount)));
 			for (int childIndex = 0; childIndex < childCount; ++childIndex)
@@ -1203,14 +1223,26 @@ private:
 					<= 0.0001f;
 			const size_t dirtyBegin = owner->_columnWidthDirtyBegin;
 			const size_t dirtyEnd = owner->_columnWidthDirtyEnd;
-			struct CellSnapshot final
+			std::vector<CellSnapshot> localCells;
+			const bool sharedScratch = !presenter->_layoutScratchInUse;
+			if (sharedScratch)
 			{
-				ControlWeakReference Lifetime;
-				DataGridCell* Identity = nullptr;
-				float Left = 0.0f;
-				float Width = 0.0f;
-			};
-			std::vector<CellSnapshot> cells;
+				presenter->_layoutScratchInUse = true;
+				presenter->_layoutScratch.clear();
+			}
+			auto scratchGuard = MakeScopeExit(
+				[presenterLifetime, sharedScratch]
+				{
+					if (!sharedScratch) return;
+					if (auto* live = dynamic_cast<DataGridCellsPresenter*>(
+						presenterLifetime.Get()))
+					{
+						live->_layoutScratch.clear();
+						live->_layoutScratchInUse = false;
+					}
+				});
+			auto& cells = sharedScratch
+				? presenter->_layoutScratch : localCells;
 			const int childCount = context.ChildCount();
 			cells.reserve(static_cast<size_t>((std::max)(0, childCount)));
 			for (int childIndex = 0; childIndex < childCount; ++childIndex)
@@ -1474,6 +1506,8 @@ private:
 	}
 
 	DataGridRow* _row = nullptr;
+	std::vector<CellSnapshot> _layoutScratch;
+	bool _layoutScratchInUse = false;
 	float _lastArrangedHeight =
 		(std::numeric_limits<float>::quiet_NaN)();
 };
@@ -4019,6 +4053,7 @@ bool DataGridCell::ReplaceContent(bool editing, std::wstring* outError)
 		(void)live->SetVisualContent(std::move(content));
 		live = dynamic_cast<DataGridCell*>(cellLifetime.Get());
 		if (!live) return false;
+		if (live->_row) live->_row->InvalidateValidationVisualTracking();
 		live->_editingElement = editing ? raw : nullptr;
 		live->_isEditing = editing;
 		return true;
@@ -4877,10 +4912,18 @@ bool DataGridRow::RefreshValidationState()
 	const ControlWeakReference rowLifetime(this);
 	const ControlWeakReference ownerLifetime(GetDataGridOwner());
 	_refreshingValidation = true;
+	_validationStateDirty = false;
+	bool refreshCommitted = false;
 	auto reset = MakeScopeExit([rowLifetime]
 	{
 		if (auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get()))
 			row->_refreshingValidation = false;
+	});
+	auto restoreDirty = MakeScopeExit([rowLifetime, &refreshCommitted]
+	{
+		if (refreshCommitted) return;
+		if (auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get()))
+			row->_validationStateDirty = true;
 	});
 
 	struct ValidationPath final
@@ -4999,45 +5042,89 @@ bool DataGridRow::RefreshValidationState()
 	row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
 	if (!row) return false;
 	row->UpdateValidationVisual();
+	refreshCommitted = true;
 	return rowLifetime.Get() != nullptr;
+}
+
+void DataGridRow::InvalidateValidationVisualTracking() noexcept
+{
+	if (++_validationVisualRevision == 0) ++_validationVisualRevision;
+	_validationStateDirty = true;
 }
 
 bool DataGridRow::AttachValidationTracking()
 {
 	const ControlWeakReference rowLifetime(this);
-	_validationConnections.clear();
-	if (!rowLifetime.Get()) return false;
-	if (auto* source = _item.Get())
-		if (auto* changed = source->ValidationChanged())
-			_validationConnections.push_back(changed->Subscribe(
-				[rowLifetime](const BindingValidationChangedEventArgs&)
-				{
-					if (auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get()))
-						(void)row->RefreshValidationState();
-				}));
-	if (!rowLifetime.Get()) return false;
-	std::unordered_set<Control*> visited;
-	const auto subscribe = [&](Control* root, const auto& self) -> bool
+	const bool itemChanged = _validationTrackedItem.Shared() != _item.Shared();
+	if (itemChanged)
 	{
-		if (!root || !visited.insert(root).second) return true;
-		_validationConnections.push_back(
-			root->OnValidationStateChanged.Subscribe(
+		_itemValidationConnection.Disconnect();
+		_validationTrackedItem = {};
+		_validationStateDirty = true;
+		const auto item = _item;
+		EventConnection nextConnection;
+		if (auto* source = item.Get())
+			if (auto* changed = source->ValidationChanged())
+				nextConnection = changed->Subscribe(
 				[rowLifetime](const BindingValidationChangedEventArgs&)
 				{
 					if (auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get()))
+					{
+						row->_validationStateDirty = true;
 						(void)row->RefreshValidationState();
-				}));
-		if (!rowLifetime.Get()) return false;
-		std::vector<ControlWeakReference> children;
-		children.reserve(root->GetVisualChildrenView().size());
-		for (auto* child : root->GetVisualChildrenView())
-			children.emplace_back(child);
-		for (const auto& child : children)
-			if (!self(child.Get(), self)) return false;
-		return true;
-	};
-	if (!subscribe(_cellsGrid, subscribe)) return false;
-	return RefreshValidationState();
+					}
+				});
+		auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
+		if (!row || row->_item.Shared() != item.Shared()) return false;
+		row->_itemValidationConnection = std::move(nextConnection);
+		row->_validationTrackedItem = item;
+	}
+
+	auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
+	if (!row) return false;
+	const bool visualChanged = row->_appliedValidationVisualRevision
+		!= row->_validationVisualRevision;
+	if (visualChanged)
+	{
+		row->_visualValidationConnections.clear();
+		row->_validationStateDirty = true;
+		const size_t visualRevision = row->_validationVisualRevision;
+		std::unordered_set<Control*> visited;
+		const auto subscribe = [&](Control* root, const auto& self) -> bool
+		{
+			auto* current = dynamic_cast<DataGridRow*>(rowLifetime.Get());
+			if (!current || current->_validationVisualRevision != visualRevision)
+				return false;
+			if (!root || !visited.insert(root).second) return true;
+			current->_visualValidationConnections.push_back(
+				root->OnValidationStateChanged.Subscribe(
+					[rowLifetime](const BindingValidationChangedEventArgs&)
+					{
+						if (auto* live = dynamic_cast<DataGridRow*>(
+							rowLifetime.Get()))
+						{
+							live->_validationStateDirty = true;
+							(void)live->RefreshValidationState();
+						}
+					}));
+			if (!rowLifetime.Get()) return false;
+			std::vector<ControlWeakReference> children;
+			children.reserve(root->GetVisualChildrenView().size());
+			for (auto* child : root->GetVisualChildrenView())
+				children.emplace_back(child);
+			for (const auto& child : children)
+				if (!self(child.Get(), self)) return false;
+			return true;
+		};
+		if (!subscribe(row->_cellsGrid, subscribe)) return false;
+		row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
+		if (!row || row->_validationVisualRevision != visualRevision)
+			return false;
+		row->_appliedValidationVisualRevision = visualRevision;
+	}
+	row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
+	if (!row) return false;
+	return row->_validationStateDirty ? row->RefreshValidationState() : true;
 }
 
 void DataGridRow::UpdateValidationVisual()
@@ -5076,7 +5163,11 @@ bool DataGridRow::Initialize(
 {
 	if (outError) outError->clear();
 	const ControlWeakReference ownerLifetime(&owner);
-	_validationConnections.clear();
+	_itemValidationConnection.Disconnect();
+	_visualValidationConnections.clear();
+	_validationTrackedItem = {};
+	_appliedValidationVisualRevision = 0;
+	InvalidateValidationVisualTracking();
 	_rowLayoutGrid = nullptr;
 	_rowHeaderHost = nullptr;
 	_cellsGrid = nullptr;
@@ -5419,6 +5510,7 @@ bool DataGridRow::RefreshRealizedColumns(
 	_realizedFrozenColumnEnd = frozenEnd;
 	_realizedColumnBegin = begin;
 	_realizedColumnEnd = end;
+	InvalidateValidationVisualTracking();
 	_appliedColumnWidthProjectionRevision = 0;
 	_appliedHorizontalScrollOffset =
 		(std::numeric_limits<double>::quiet_NaN)();
@@ -6390,7 +6482,11 @@ void DataGridColumnHeader::EndColumnResize(bool cancel)
 	_resizeStartRenderX = 0.0;
 	_resizeStartWidth = 0.0;
 	const ControlWeakReference ownerLifetime(_owner);
-	if (_owner) _owner->EndColumnResizeTransaction(cancel);
+	if (!cancel)
+		if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
+			(void)owner->ApplyPendingColumnResizeInput();
+	if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
+		owner->EndColumnResizeTransaction(cancel);
 	if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
 		owner->ApplyPendingColumnWidths();
 	if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
@@ -8777,6 +8873,9 @@ void DataGridRowHeader::EndRowResize(bool cancel)
 	auto* row = GetRowOwner();
 	const ControlWeakReference ownerLifetime(
 		row ? row->GetDataGridOwner() : nullptr);
+	if (!cancel)
+		if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
+			(void)owner->ApplyPendingRowResizeInput();
 	if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
 		owner->EndRowResizeTransaction(cancel);
 	if (IsMouseCaptured()) (void)ReleaseMouseCapture();
@@ -10157,16 +10256,37 @@ std::unique_ptr<AutomationPeer> DataGrid::OnCreateAutomationPeer()
 void DataGrid::PrepareMeasureCore(
 	const cui::core::Constraints& available)
 {
+	(void)ApplyPendingRowResizeInput();
 	ListBox::PrepareMeasureCore(available);
 	// A native resize burst may publish dozens of Width values before the next
 	// layout pass. Project only the newest value into the realized header/rows,
 	// before their template subtree measures against it.
+	(void)ApplyPendingColumnResizeInput();
 	ApplyPendingColumnWidths();
 }
 
 void DataGrid::PreparePresentation()
 {
 	const ControlWeakReference ownerLifetime(this);
+	const bool coalescedColumnResizeFrame =
+		(std::isfinite(_columnResizePendingRawWidth)
+			|| _columnWidthRefreshPending)
+		&& !_columnResizeSnapshot.empty();
+	// The input event already queued damage for this frame. Width solving and
+	// projection can invalidate changed descendants again while the retained
+	// scene is being prepared, so merge those requests into the frame in flight
+	// instead of posting an otherwise redundant follow-up paint.
+	ScopedVisualInvalidation localFrame(
+		*this, !coalescedColumnResizeFrame);
+	(void)ApplyPendingRowResizeInput();
+	(void)ApplyPendingColumnResizeInput();
+	if (!ownerLifetime.Get()) return;
+	if (_horizontalScrollAlignmentPending)
+	{
+		_horizontalScrollAlignmentPending = false;
+		RefreshHorizontalScrollAlignment();
+		if (!ownerLifetime.Get()) return;
+	}
 	// Native column dragging schedules a DataGrid-local damage frame instead of
 	// invalidating the Window measure root. Project the newest coalesced widths
 	// immediately before the retained scene prepares this node, then let the
@@ -10177,7 +10297,6 @@ void DataGrid::PreparePresentation()
 		// that brought us into this frame already covers that complete suffix, so
 		// retain the geometry revisions but discard the duplicate future damage.
 		// This prevents a drag from perpetually carrying one redundant paint turn.
-		ScopedVisualInvalidation localFrame(*this, false);
 		ApplyPendingColumnWidths(false);
 		ListBox::PreparePresentation();
 		if (auto* live = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
@@ -11854,12 +11973,19 @@ bool DataGrid::SynchronizeRealizedRowLifecycle()
 	}
 	const auto previouslyLoaded = _lifecycleLoadedRows;
 	_lifecycleLoadedRows = rows;
+	std::unordered_set<Control*> currentRows;
+	currentRows.reserve(rows.size());
+	for (const auto& row : rows)
+		if (auto* value = row.Get()) currentRows.insert(value);
+	std::unordered_set<Control*> previousRows;
+	previousRows.reserve(previouslyLoaded.size());
+	for (const auto& row : previouslyLoaded)
+		if (auto* value = row.Get()) previousRows.insert(value);
 	for (const auto& previous : previouslyLoaded)
 	{
 		auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get());
 		if (!owner || owner->_lifecycleLoadedRows != rows) return false;
-		if (std::find(rows.begin(), rows.end(), previous) != rows.end())
-			continue;
+		if (currentRows.contains(previous.Get())) continue;
 		if (auto* retired = dynamic_cast<DataGridRow*>(previous.Get()))
 			if (!owner->RaiseRowLifecycleEvent(owner->UnloadingRow, *retired))
 				return false;
@@ -11868,8 +11994,7 @@ bool DataGrid::SynchronizeRealizedRowLifecycle()
 	{
 		auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get());
 		if (!owner || owner->_lifecycleLoadedRows != rows) return false;
-		if (std::find(previouslyLoaded.begin(), previouslyLoaded.end(), current)
-			!= previouslyLoaded.end()) continue;
+		if (previousRows.contains(current.Get())) continue;
 		if (auto* loaded = dynamic_cast<DataGridRow*>(current.Get()))
 			if (!owner->RaiseRowLifecycleEvent(owner->LoadingRow, *loaded))
 				return false;
@@ -12351,6 +12476,17 @@ bool DataGrid::ResizeRowInTransaction(double pixelHeight)
 {
 	if (!_rowResizeActive || !_canUserResizeRows
 		|| !std::isfinite(pixelHeight)) return false;
+	if (GetPresentationWindow() && !_applyingPendingRowResizeInput)
+	{
+		_rowResizePendingHeight = pixelHeight;
+		// Layout requests are coalesced by the Window. This guarantees the latest
+		// height is consumed by PrepareMeasureCore before the next presented frame
+		// without rebuilding sparse extent metadata for every pointer message.
+		RequestLayout();
+		return true;
+	}
+	_rowResizePendingHeight =
+		(std::numeric_limits<double>::quiet_NaN)();
 	const auto items = GetItemsView();
 	BindingSourceReference item;
 	size_t occurrence = DataGridCellInfo::InvalidIndex;
@@ -12379,14 +12515,37 @@ bool DataGrid::ResizeRowInTransaction(double pixelHeight)
 	projected->Extent = pixelHeight;
 	if (++_virtualRowHeightOverrideRevision == 0)
 		++_virtualRowHeightOverrideRevision;
-	RefreshVirtualScrollMetrics();
+	if (!TryUpdateVirtualizedItemExtentOverride(
+		_rowResizeIndex, pixelHeight))
+		RefreshVirtualScrollMetrics();
 	ApplyRowHeightToRealizedItem(_rowResizeIndex);
 	return true;
+}
+
+bool DataGrid::ApplyPendingRowResizeInput()
+{
+	if (!std::isfinite(_rowResizePendingHeight)) return true;
+	if (!_rowResizeActive) return false;
+	const double height = std::exchange(
+		_rowResizePendingHeight,
+		(std::numeric_limits<double>::quiet_NaN)());
+	const bool previous = _applyingPendingRowResizeInput;
+	_applyingPendingRowResizeInput = true;
+	const ControlWeakReference ownerLifetime(this);
+	auto restore = MakeScopeExit([ownerLifetime, previous]
+	{
+		if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
+			owner->_applyingPendingRowResizeInput = previous;
+	});
+	const bool applied = ResizeRowInTransaction(height);
+	return applied && ownerLifetime.Get() != nullptr;
 }
 
 void DataGrid::EndRowResizeTransaction(bool cancel)
 {
 	if (!_rowResizeActive) return;
+	if (cancel) _rowResizePendingHeight =
+		(std::numeric_limits<double>::quiet_NaN)();
 	const auto item = _rowResizeItem;
 	const size_t occurrence = _rowResizeOccurrence;
 	const size_t rowIndex = _rowResizeIndex;
@@ -12408,6 +12567,8 @@ void DataGrid::EndRowResizeTransaction(bool cancel)
 	_rowResizeOccurrence = DataGridCellInfo::InvalidIndex;
 	_rowResizeIndex = DataGridCellInfo::InvalidIndex;
 	_rowResizeHeight = 0.0;
+	_rowResizePendingHeight =
+		(std::numeric_limits<double>::quiet_NaN)();
 	const ControlWeakReference ownerLifetime(this);
 	(void)RefreshRowHeightOverrideProjection();
 	if (auto* live = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
@@ -12772,6 +12933,7 @@ void DataGrid::OnControlTemplatePresentationChanged()
 	_selectAllButton.Reset();
 	_scrollViewer.Reset();
 	_horizontalScrollOffset = 0.0;
+	_horizontalScrollAlignmentPending = false;
 	_columnViewportWidth =
 		(std::numeric_limits<double>::quiet_NaN)();
 	InvalidateColumnWidthCache();
@@ -12833,8 +12995,9 @@ void DataGrid::OnControlTemplatePresentationChanged()
 	{
 		live->_scrollViewer = scroll;
 		live->_dataGridScrollChanged = scroll->OnScrollChanged.Subscribe(
-			[ownerLifetime](Control*, ScrollChangedEventArgs& args)
+			[ownerLifetime](Control* sender, ScrollChangedEventArgs& args)
 			{
+				auto* activeScroll = dynamic_cast<ScrollViewer*>(sender);
 				if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
 				{
 					constexpr double epsilon = 0.000001;
@@ -12860,7 +13023,13 @@ void DataGrid::OnControlTemplatePresentationChanged()
 					owner = dynamic_cast<DataGrid*>(ownerLifetime.Get());
 					if (!owner) return;
 					if (horizontalChanged)
-						owner->RefreshHorizontalScrollAlignment();
+					{
+						if (owner->GetPresentationWindow()
+							&& activeScroll
+							&& activeScroll->_lastScrollChangeWasInteractive)
+							owner->_horizontalScrollAlignmentPending = true;
+						else owner->RefreshHorizontalScrollAlignment();
+					}
 				}
 			});
 	}
@@ -13755,6 +13924,9 @@ void DataGrid::OnGeneratedItemClearing(Control& visual)
 	const ControlWeakReference rowLifetime(row);
 	const auto clearingItem = row->GetItem();
 	const size_t clearingIndex = row->ItemIndex();
+	row->_itemValidationConnection.Disconnect();
+	row->_validationTrackedItem = {};
+	row->_validationStateDirty = true;
 	row->SetCurrentIsNewItem(false);
 	row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
 	if (!ownerLifetime.Get() || !row || row->GetDataGridOwner() != this
@@ -19051,6 +19223,14 @@ bool DataGrid::ResizeColumnInTransaction(
 		EndColumnResizeTransaction(true);
 		return false;
 	}
+	if (GetPresentationWindow() && !_applyingPendingColumnResizeInput)
+	{
+		_columnResizePendingRawWidth = pixelWidth;
+		InvalidateVisual();
+		return true;
+	}
+	_columnResizePendingRawWidth =
+		(std::numeric_limits<double>::quiet_NaN)();
 	_columnResizeLastRawWidth = pixelWidth;
 	pixelWidth += _columnResizeInputBias;
 	bool previousProjectionDiffers = false;
@@ -19447,8 +19627,31 @@ bool DataGrid::ResizeColumnInTransaction(
 	return true;
 }
 
+bool DataGrid::ApplyPendingColumnResizeInput()
+{
+	if (!std::isfinite(_columnResizePendingRawWidth)) return true;
+	if (_columnResizeTransactionIndex == DataGridCellInfo::InvalidIndex
+		|| _columnResizeSnapshot.empty()) return false;
+	const double width = std::exchange(
+		_columnResizePendingRawWidth,
+		(std::numeric_limits<double>::quiet_NaN)());
+	const bool previous = _applyingPendingColumnResizeInput;
+	_applyingPendingColumnResizeInput = true;
+	const ControlWeakReference ownerLifetime(this);
+	auto restore = MakeScopeExit([ownerLifetime, previous]
+	{
+		if (auto* owner = dynamic_cast<DataGrid*>(ownerLifetime.Get()))
+			owner->_applyingPendingColumnResizeInput = previous;
+	});
+	const bool applied = ResizeColumnInTransaction(
+		_columnResizeTransactionIndex, width);
+	return applied && ownerLifetime.Get() != nullptr;
+}
+
 void DataGrid::EndColumnResizeTransaction(bool cancel)
 {
+	if (cancel) _columnResizePendingRawWidth =
+		(std::numeric_limits<double>::quiet_NaN)();
 	if (_columnResizeSnapshot.empty())
 	{
 		_columnResizeWorkingSnapshot.clear();
@@ -19457,6 +19660,8 @@ void DataGrid::EndColumnResizeTransaction(bool cancel)
 		_columnResizeLastRawWidth =
 			(std::numeric_limits<double>::quiet_NaN)();
 		_columnResizeInputBias = 0.0;
+		_columnResizePendingRawWidth =
+			(std::numeric_limits<double>::quiet_NaN)();
 		return;
 	}
 	const bool canRestore = cancel;
@@ -19481,6 +19686,8 @@ void DataGrid::EndColumnResizeTransaction(bool cancel)
 	_columnResizeLastRawWidth =
 		(std::numeric_limits<double>::quiet_NaN)();
 	_columnResizeInputBias = 0.0;
+	_columnResizePendingRawWidth =
+		(std::numeric_limits<double>::quiet_NaN)();
 	if (canRestore) RefreshColumnWidths(true);
 }
 
@@ -19535,6 +19742,9 @@ void DataGrid::ApplyPendingColumnWidths(bool refreshVirtualMetrics)
 		auto* row = dynamic_cast<DataGridRow*>(rowLifetime.Get());
 		live = dynamic_cast<DataGrid*>(ownerLifetime.Get());
 		if (!live) return;
+		if (activeResizeFrame && row
+			&& !live->IsVirtualizedItemInViewport(row->ItemIndex()))
+			continue;
 		if (row && row->GetDataGridOwner() == live)
 		{
 			row->UpdateColumnWidths(false);
@@ -21082,16 +21292,23 @@ void DataGrid::OnGeneratedItemsRealized()
 	if (!live->SynchronizeRealizedRowLifecycle()) return;
 	live = dynamic_cast<DataGrid*>(ownerLifetime.Get());
 	if (!live) return;
+	std::unordered_set<Control*> currentValidationRows;
+	currentValidationRows.reserve(rows.size());
+	for (const auto& row : rows)
+		if (auto* value = row.Get()) currentValidationRows.insert(value);
 	// ItemsControl has already moved retired containers into its recycle pool
 	// when this callback runs. Retain weak identities from the previous frame so
 	// those no-longer-realized rows can release source validation callbacks even
 	// though they are no longer addressable through GetGeneratedItem.
 	for (const auto& previous : live->_validationTrackedRows)
 	{
-		if (std::find(rows.begin(), rows.end(), previous) != rows.end())
-			continue;
+		if (currentValidationRows.contains(previous.Get())) continue;
 		if (auto* retired = dynamic_cast<DataGridRow*>(previous.Get()))
-			retired->_validationConnections.clear();
+		{
+			retired->_itemValidationConnection.Disconnect();
+			retired->_validationTrackedItem = {};
+			retired->_validationStateDirty = true;
+		}
 	}
 	live->_validationTrackedRows = rows;
 	for (const auto& rowLifetime : rows)

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -390,6 +391,11 @@ protected:
 		return 0.0;
 	}
 	void RefreshVirtualScrollMetrics() { ConfigureVirtualHost(); }
+	/** Updates one persistent virtual item extent without rebuilding the complete
+	 *  sparse projection. Returns false when the active host cannot accept it. */
+	bool TryUpdateVirtualizedItemExtentOverride(
+		size_t itemIndex, double extent);
+	bool IsVirtualizedItemInViewport(size_t itemIndex) const noexcept;
 	/** Called after the active ControlTemplate root changes. */
 	void OnControlTemplatePresentationChanged() override {}
 	/** Replaces the framework ItemsHost before any items are attached. */
@@ -526,6 +532,16 @@ private:
 	bool _realizingViewport = false;
 	bool _applyingCollectionChange = false;
 	bool _virtualCacheRestorePending = false;
+	// Native scroll input can publish offsets substantially faster than the
+	// retained scene can present them.  A presented ItemsControl realizes the
+	// newest range from PreparePresentation; detached/test controls retain the
+	// historical synchronous behavior.
+	bool _virtualRealizationPending = false;
+	double _lastVirtualRealizationOffset =
+		(std::numeric_limits<double>::quiet_NaN)();
+	std::vector<CrossIndexRecycleCandidate> _virtualRecycleCandidatesScratch;
+	std::vector<size_t> _virtualAdditionIndicesScratch;
+	std::vector<size_t> _virtualRemovalIndicesScratch;
 	bool _migratingAuthoredItems = false;
 	size_t _itemsSourceUpdateDepth = 0;
 	bool _itemsSourceReplacementInProgress = false;
@@ -565,7 +581,9 @@ private:
 	void AttachPreparedItem(PreparedItem&& item);
 	void ReorderRealizedChildren();
 	void ClearRealizedItems(bool keepForRecycle);
-	bool RealizeVirtualViewport(bool localLayoutForScroll = false);
+	bool RealizeVirtualViewport(
+		bool localLayoutForScroll = false,
+		bool useVisibleOnlyRange = false);
 	void RestoreVirtualCacheAfterVerticalThumbDrag();
 	bool RealizeVirtualRange(
 		size_t first, size_t last, bool localLayoutForScroll = false);

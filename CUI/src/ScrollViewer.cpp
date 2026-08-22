@@ -679,8 +679,9 @@ void ScrollViewer::PublishScrollState(
 }
 
 void ScrollViewer::SetScrollOffsetCore(
-	double horizontalOffset, double verticalOffset)
+	double horizontalOffset, double verticalOffset, bool interactive)
 {
+	_lastScrollChangeWasInteractive = interactive;
 	const ControlWeakReference lifetime(this);
 	auto layout = CalcScrollLayout();
 	auto* live = dynamic_cast<ScrollViewer*>(lifetime.Get());
@@ -881,7 +882,7 @@ void ScrollViewer::UpdateVerticalScrollByThumb(float localY, const ScrollLayout&
 	if (grab <= 0.0f) grab = thumbH * 0.5f;
 	float target = std::clamp(localY - grab, 0.0f, moveSpace);
 	float per = target / moveSpace;
-	SetScrollOffsetCore(_horizontalOffset, per * layout.MaxScrollY);
+	SetScrollOffsetCore(_horizontalOffset, per * layout.MaxScrollY, true);
 }
 
 void ScrollViewer::UpdateHorizontalScrollByThumb(float localX, const ScrollLayout& layout)
@@ -900,7 +901,7 @@ void ScrollViewer::UpdateHorizontalScrollByThumb(float localX, const ScrollLayou
 	if (grab <= 0.0f) grab = thumbW * 0.5f;
 	float target = std::clamp(localX - grab, 0.0f, moveSpace);
 	float per = target / moveSpace;
-	SetScrollOffsetCore(per * layout.MaxScrollX, _verticalOffset);
+	SetScrollOffsetCore(per * layout.MaxScrollX, _verticalOffset, true);
 }
 
 void ScrollViewer::OnRender()
@@ -1021,7 +1022,7 @@ bool ScrollViewer::ProcessInput(const InputReport& input)
 		{
 			SetScrollOffsetCore(
 				_horizontalOffset,
-				_verticalOffset - (steps * _mouseWheelStep));
+				_verticalOffset - (steps * _mouseWheelStep), true);
 		}
 		auto eventArgs = input.CreateMouseEventArgs();
 		this->OnMouseWheel(this, eventArgs);
@@ -1118,42 +1119,42 @@ bool ScrollViewer::ProcessInput(const InputReport& input)
 		case Key::Up:
 			if (layout.MaxScrollY > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset, _verticalOffset - lineStepY);
+				SetScrollOffsetCore(_horizontalOffset, _verticalOffset - lineStepY, true);
 				handledScroll = true;
 			}
 			break;
 		case Key::Down:
 			if (layout.MaxScrollY > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset, _verticalOffset + lineStepY);
+				SetScrollOffsetCore(_horizontalOffset, _verticalOffset + lineStepY, true);
 				handledScroll = true;
 			}
 			break;
 		case Key::Left:
 			if (layout.MaxScrollX > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset - lineStepX, _verticalOffset);
+				SetScrollOffsetCore(_horizontalOffset - lineStepX, _verticalOffset, true);
 				handledScroll = true;
 			}
 			break;
 		case Key::Right:
 			if (layout.MaxScrollX > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset + lineStepX, _verticalOffset);
+				SetScrollOffsetCore(_horizontalOffset + lineStepX, _verticalOffset, true);
 				handledScroll = true;
 			}
 			break;
 		case Key::PageUp:
 			if (layout.MaxScrollY > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset, _verticalOffset - pageStepY);
+				SetScrollOffsetCore(_horizontalOffset, _verticalOffset - pageStepY, true);
 				handledScroll = true;
 			}
 			break;
 		case Key::PageDown:
 			if (layout.MaxScrollY > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset, _verticalOffset + pageStepY);
+				SetScrollOffsetCore(_horizontalOffset, _verticalOffset + pageStepY, true);
 				handledScroll = true;
 			}
 			break;
@@ -1162,18 +1163,18 @@ bool ScrollViewer::ProcessInput(const InputReport& input)
 			{
 				if (layout.MaxScrollX > 0.0f || layout.MaxScrollY > 0.0f)
 				{
-					SetScrollOffsetCore(0.0, 0.0);
+					SetScrollOffsetCore(0.0, 0.0, true);
 					handledScroll = true;
 				}
 			}
 			else if (layout.MaxScrollY > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset, 0.0);
+				SetScrollOffsetCore(_horizontalOffset, 0.0, true);
 				handledScroll = true;
 			}
 			else if (layout.MaxScrollX > 0.0f)
 			{
-				SetScrollOffsetCore(0.0, _verticalOffset);
+				SetScrollOffsetCore(0.0, _verticalOffset, true);
 				handledScroll = true;
 			}
 			break;
@@ -1182,18 +1183,18 @@ bool ScrollViewer::ProcessInput(const InputReport& input)
 			{
 				if (layout.MaxScrollX > 0.0f || layout.MaxScrollY > 0.0f)
 				{
-					SetScrollOffsetCore(layout.MaxScrollX, layout.MaxScrollY);
+					SetScrollOffsetCore(layout.MaxScrollX, layout.MaxScrollY, true);
 					handledScroll = true;
 				}
 			}
 			else if (layout.MaxScrollY > 0.0f)
 			{
-				SetScrollOffsetCore(_horizontalOffset, layout.MaxScrollY);
+				SetScrollOffsetCore(_horizontalOffset, layout.MaxScrollY, true);
 				handledScroll = true;
 			}
 			else if (layout.MaxScrollX > 0.0f)
 			{
-				SetScrollOffsetCore(layout.MaxScrollX, _verticalOffset);
+				SetScrollOffsetCore(layout.MaxScrollX, _verticalOffset, true);
 				handledScroll = true;
 			}
 			break;

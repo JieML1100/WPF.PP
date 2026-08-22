@@ -1276,6 +1276,7 @@ public:
 
 private:
 	friend class DataGrid;
+	friend class DataGridCell;
 	friend class DataGridCellsPresenter;
 	static const DependencyPropertyKey& IsEditingPropertyKey();
 	static const DependencyPropertyKey& IsNewItemPropertyKey();
@@ -1285,6 +1286,7 @@ private:
 	void SetCurrentIsNewItem(bool value);
 	bool RefreshValidationState();
 	bool AttachValidationTracking();
+	void InvalidateValidationVisualTracking() noexcept;
 	void UpdateValidationVisual();
 	bool Initialize(
 		DataGrid& owner,
@@ -1309,7 +1311,12 @@ private:
 	bool _refreshingValidation = false;
 	std::vector<BindingValidationResult> _validationErrors;
 	ControlTemplateReference _validationErrorTemplate;
-	std::vector<EventConnection> _validationConnections;
+	EventConnection _itemValidationConnection;
+	std::vector<EventConnection> _visualValidationConnections;
+	BindingSourceReference _validationTrackedItem;
+	size_t _validationVisualRevision = 1;
+	size_t _appliedValidationVisualRevision = 0;
+	bool _validationStateDirty = true;
 	Grid* _rowLayoutGrid = nullptr;
 	Grid* _rowHeaderHost = nullptr;
 	DataGridCellsPresenter* _cellsGrid = nullptr;
@@ -2145,6 +2152,9 @@ private:
 	double _columnResizeLastRawWidth =
 		(std::numeric_limits<double>::quiet_NaN)();
 	double _columnResizeInputBias = 0.0;
+	double _columnResizePendingRawWidth =
+		(std::numeric_limits<double>::quiet_NaN)();
+	bool _applyingPendingColumnResizeInput = false;
 	// User row sizes are attached to stable item occurrences. The second vector
 	// is the sorted current-index projection consumed by the virtual offset host.
 	std::vector<RowHeightOverride> _rowHeightOverrides;
@@ -2158,6 +2168,9 @@ private:
 	size_t _rowResizeIndex = DataGridCellInfo::InvalidIndex;
 	double _rowResizeHeight = 0.0;
 	bool _rowResizeActive = false;
+	double _rowResizePendingHeight =
+		(std::numeric_limits<double>::quiet_NaN)();
+	bool _applyingPendingRowResizeInput = false;
 	// Realized header/row grids cache the revision they projected. This keeps a
 	// vertical viewport change from rebuilding identical column definitions.
 	size_t _columnWidthProjectionRevision = 1;
@@ -2217,6 +2230,7 @@ private:
 	Event<void(DataGrid*)> _currentColumnChanged;
 	Event<void(DataGrid*)> _currentCellProjectionChanged;
 	double _horizontalScrollOffset = 0.0;
+	bool _horizontalScrollAlignmentPending = false;
 	int _frozenColumnCount = 0;
 	bool _coercingFrozenColumnCountForSchema = false;
 	bool _autoColumnsChangedDuringPreparation = false;
@@ -2386,6 +2400,7 @@ private:
 	bool ClearRowHeightOverride(size_t rowIndex);
 	bool BeginRowResizeTransaction(size_t rowIndex, double& startHeight);
 	bool ResizeRowInTransaction(double pixelHeight);
+	bool ApplyPendingRowResizeInput();
 	void EndRowResizeTransaction(bool cancel);
 	void RefreshRealizedRowValidationStates(bool coerceTemplate);
 	void RefreshHeaderPresenter();
@@ -2507,6 +2522,7 @@ private:
 	bool BeginColumnResizeTransaction(
 		size_t columnIndex, bool compensateLeft);
 	bool ResizeColumnInTransaction(size_t columnIndex, double pixelWidth);
+	bool ApplyPendingColumnResizeInput();
 	void EndColumnResizeTransaction(bool cancel);
 	bool ResizeColumnCore(
 		size_t columnIndex, double pixelWidth,
