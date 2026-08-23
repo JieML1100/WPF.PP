@@ -1527,7 +1527,7 @@ protected:
 	friend DataBindingCollection;
 	friend class Binding;
 	friend class FocusManager;
-	friend class DependencyPropertyMetadata;
+	friend class ::DependencyPropertyMetadata;
 	friend class DependencyPropertyRegistry;
 #if CUI_ENABLE_DYNAMIC_XAML
 	friend DeclarativeType;
@@ -1585,7 +1585,7 @@ protected:
 	/** Allocation-free enumeration of inherited DP identities declared by this type. */
 	using InheritedPropertyVisitor = void(*)(
 		void* context, const DependencyProperty& property);
-	const DependencyPropertyMetadata* ResolveExactDependencyPropertyMetadata(
+	const ::DependencyPropertyMetadata* ResolveExactDependencyPropertyMetadata(
 		const DependencyProperty& property) const override;
 	virtual void VisitDeclaredInheritedProperties(
 		void* context, InheritedPropertyVisitor visitor) const;

@@ -3079,7 +3079,7 @@ void Control::ClearDeclarativeTemplateScope()
 	_declarativeVisualStates.reset();
 }
 
-const DependencyPropertyMetadata*
+const ::DependencyPropertyMetadata*
 Control::ResolveExactDependencyPropertyMetadata(
 	const DependencyProperty& property) const
 {
