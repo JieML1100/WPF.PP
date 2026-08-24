@@ -226,7 +226,11 @@ namespace
 			result.top = (std::max)(result.top, clip.top);
 			result.right = (std::min)(result.right, clip.right);
 			result.bottom = (std::min)(result.bottom, clip.bottom);
-			return result.right > result.left && result.bottom > result.top;
+			// Empty ancestor intersections are valid zero coverage. Rejecting one
+			// aborts the unrelated Window frame during viewport resizes.
+			result.right = (std::max)(result.right, result.left);
+			result.bottom = (std::max)(result.bottom, result.top);
+			return true;
 		};
 		auto addClip = [&](D2D1_RECT_F localClip,
 			float radiusX,
@@ -1281,20 +1285,54 @@ bool PresentationScene::PrepareComposition(
 	{
 		SceneWorkAccumulator nodeClock(
 			preparation.NodePreparationMicroseconds);
+		std::vector<size_t> ancestorScratch;
+		try { ancestorScratch.reserve(16u); }
+		catch (...) { return false; }
+		auto prepareNode = [&](size_t nodeIndex)
+		{
+			if (nodeIndex >= _nodes.size()) return false;
+			if (_preparedNodeScratch[nodeIndex] != 0u) return true;
+			Control* prepared = nullptr;
+			if (!PrepareNodeForRendering(_nodes[nodeIndex], prepared))
+				return false;
+			_preparedNodeScratch[nodeIndex] = uint8_t{ 1 };
+			++preparation.PreparedNodeCount;
+			return true;
+		};
 		for (const auto& segment : _segments)
 		{
-			if (!segment.IsolationRoot) continue;
+			auto* isolationRoot = segment.IsolationRoot.Get();
+			if (!isolationRoot) continue;
+			// Attached layout animations can invalidate an ancestor's arrange policy.
+			// Commit that chain root-to-leaf before reading isolation bounds; the
+			// preparation marks keep shared ancestors single-pass.
+			ancestorScratch.clear();
+			try
+			{
+				for (auto* ancestor = isolationRoot->GetVisualParent();
+					ancestor; ancestor = ancestor->GetVisualParent())
+				{
+					const auto found = _nodeIndex.find(ancestor);
+					if (found != _nodeIndex.end()
+						&& found->second < _nodes.size()
+						&& _preparedNodeScratch[found->second] == 0u)
+						ancestorScratch.push_back(found->second);
+					if (cui::framework::PresentationAccess::
+						BreaksVisualPresentationInheritance(*ancestor)) break;
+				}
+			}
+			catch (...) { return false; }
+			for (auto it = ancestorScratch.rbegin();
+				it != ancestorScratch.rend(); ++it)
+				if (!prepareNode(*it)) return false;
 			const size_t end = (std::min)(segment.NodeEnd, _nodes.size());
 			for (size_t nodeIndex = (std::min)(segment.NodeStart, end);
 				nodeIndex < end; ++nodeIndex)
 			{
 				auto& node = _nodes[nodeIndex];
-				Control* prepared = nullptr;
 				if (node.NativeComposition
 					|| (node.Overlay && !node.OverlaySegmented)
-					|| !PrepareNodeForRendering(node, prepared)) return false;
-				_preparedNodeScratch[nodeIndex] = uint8_t{ 1 };
-				++preparation.PreparedNodeCount;
+					|| !prepareNode(nodeIndex)) return false;
 			}
 		}
 	}

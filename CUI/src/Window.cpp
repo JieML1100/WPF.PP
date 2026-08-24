@@ -6534,7 +6534,12 @@ bool Window::TryGetCaptionButtonRect(CaptionButtonKind kind, RECT& out)
 {
 	if (!HasWindowChrome()) return false;
 
-	int rightEdge = static_cast<int>(std::floor(ActualWidth));
+	// ActualWidth can lag behind the native frame during maximize/restore.
+	// Caption rendering and hit testing must follow the current HWND client.
+	const auto clientPixels = GetNativeClientSizePixels();
+	const float dpiScale = (std::max)(0.001f, GetDpiScale());
+	int rightEdge = static_cast<int>(std::floor(
+		static_cast<float>(clientPixels.cx) / dpiScale));
 	int buttonHeight = GetTitleBarHeightDip();
 	int buttonWidth = buttonHeight;
 
@@ -8908,10 +8913,20 @@ bool Window::UpdateDirtyRect(const RECT& dirty, bool force)
 	if (!_renderHost->UsesComposition()
 		&& _presentationScene->RequiresComposition())
 		(void)EnsureDCompInitialized();
-	if (_renderHost->UsesComposition()
-		&& !_presentationScene->PrepareComposition(
-			*_renderHost, GetTitleBarHeightDip(), GetDpiScale()))
-		return false;
+	if (_renderHost->UsesComposition())
+	{
+		bool prepared = _presentationScene->PrepareComposition(
+			*_renderHost, GetTitleBarHeightDip(), GetDpiScale());
+		if (!prepared && SynchronizePresentationScene())
+		{
+			// Preparation may invalidate scene structure. Rebuild once before opening
+			// frame surfaces so the final animation/resize frame can converge.
+			prepared = _presentationScene->PrepareComposition(
+				*_renderHost, GetTitleBarHeightDip(), GetDpiScale());
+		}
+		if (!prepared)
+			return false;
+	}
 	SynchronizePresentationResourceGeneration();
 	frameTiming.CompositionPreparationMicroseconds =
 		timingClock.LapMicroseconds();
@@ -9997,6 +10012,7 @@ LRESULT Window::HandlePlatformWindowMessage(
 		const UINT presentationDispatch = CuiPresentationDispatchMessage();
 		if (presentationDispatch != 0 && message == presentationDispatch)
 		{
+			const bool isSettlementRetry = wParam == 1u;
 			// A nested modal loop or a layout transaction may dispatch this turn.
 			// Leave retained damage intact; EndWindowLayoutDeferral/WM_ENABLE will
 			// schedule the next eligible presentation.
@@ -10007,17 +10023,50 @@ LRESULT Window::HandlePlatformWindowMessage(
 				form->_layoutDispatchPosted = false;
 				return 0;
 			}
-			if (form->HasPendingRenderWork())
+			// Layout and preparation can queue damage after WM_PAINT consumes its
+			// entry damage. Settle one residual frame without monopolizing the UI
+			// thread; failed or non-progressing frames yield to one posted retry.
+			constexpr size_t maxSettlementPasses = 2u;
+			size_t settlementPasses = 0u;
+			const ControlWeakReference lifetime(form);
+			while (settlementPasses < maxSettlementPasses
+				&& form->HasPendingRenderWork())
 			{
-				// UpdateWindow synchronously enters the existing WM_PAINT path.  This
-				// message is outside pointer routing, so layout/render callbacks cannot
-				// corrupt an in-flight input transaction. Keep the token marked posted
-				// during the nested paint so damage raised by layout/render cannot queue
-				// an unbounded chain of presentation messages; ordinary WM_PAINT retains
-				// that residual damage.
-				::UpdateWindow(hWnd);
+				RECT nativeUpdate{};
+				if (::GetUpdateRect(hWnd, &nativeUpdate, FALSE) == FALSE)
+					(void)::InvalidateRect(hWnd, nullptr, FALSE);
+				const auto committedBefore =
+					form->GetPresentationCommittedFrameCount();
+				const BOOL updated = ::UpdateWindow(hWnd);
+				++settlementPasses;
+				form = dynamic_cast<Window*>(lifetime.Get());
+				if (!form || form->Handle != hWnd
+					|| ::IsWindow(hWnd) == FALSE) return 0;
+				const auto committedAfter =
+					form->GetPresentationCommittedFrameCount();
+				if (updated == FALSE || committedAfter <= committedBefore) break;
 			}
 			form->_layoutDispatchPosted = false;
+			bool retryPosted = false;
+			if (!isSettlementRetry && form->HasPendingRenderWork()
+				&& !form->_layoutDeferral.IsSuspended()
+				&& ::IsWindowVisible(hWnd) != FALSE
+				&& ::IsWindowEnabled(hWnd) != FALSE)
+			{
+				// Yield once before the final bounded attempt.
+				retryPosted = ::PostMessageW(
+					hWnd, presentationDispatch, 1u, 0u) != FALSE;
+				form->_layoutDispatchPosted = retryPosted;
+			}
+			// Park the native region after the bounded retry, but retain logical
+			// damage for the next external invalidation epoch.
+			const bool hasRetainedDamage = form->_renderHost
+				&& (form->_presentationInvalidated
+					|| form->_renderHost->HasPendingDamage()
+					|| form->_renderHost->NeedsFullFrame());
+			if (form->HasPendingRenderWork() && hasRetainedDamage
+				&& (isSettlementRetry || !retryPosted))
+				(void)::ValidateRect(hWnd, nullptr);
 			return 0;
 		}
 		if (message == WM_SETTINGCHANGE || message == WM_THEMECHANGED
@@ -10199,8 +10248,17 @@ LRESULT Window::HandlePlatformWindowMessage(
 					rendered = form->UpdateDirtyRect(paintDirty, false);
 			}
 			if (!rendered && hasPaintDirty && form->_renderHost)
-				form->_renderHost->QueueDamage(paintDirty);
+			{
+				// Preserve logical damage without recreating the update region from
+				// inside BeginPaint/EndPaint and spinning WM_PAINT.
+				form->_presentationInvalidated = true;
+			}
 			EndPaint(hWnd, &ps);
+			// Native exposure can enter WM_PAINT without a presentation token.
+			// Promote retained work after EndPaint validates the update region.
+			if (form->HasPendingRenderWork()
+				&& !form->_layoutDispatchPosted)
+				form->ScheduleLayoutDispatch();
 			return 0;
 		}
 		case WM_ENABLE:
