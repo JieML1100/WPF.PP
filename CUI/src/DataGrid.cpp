@@ -13024,10 +13024,15 @@ void DataGrid::OnControlTemplatePresentationChanged()
 					if (!owner) return;
 					if (horizontalChanged)
 					{
-						if (owner->GetPresentationWindow()
-							&& activeScroll
+						if (auto* window = owner->GetPresentationWindow();
+							window && activeScroll
 							&& activeScroll->_lastScrollChangeWasInteractive)
+						{
 							owner->_horizontalScrollAlignmentPending = true;
+							// Column realization changes topology; commit it before
+							// the frame's scene snapshot instead of mid-traversal.
+							window->RequestPresentationPreparation(*owner);
+						}
 						else owner->RefreshHorizontalScrollAlignment();
 					}
 				}
@@ -13090,16 +13095,58 @@ std::unique_ptr<Control> DataGrid::BuildGeneratedItem(
 	return row;
 }
 
+namespace
+{
+	/** Set while an attached row is being moved by TryRebindRealizedItemInPlace. */
+	thread_local const DataGrid* DataGridAttachedRebindOwner = nullptr;
+}
+
+bool DataGrid::CanRebindRealizedItemInPlace(
+	const Control& visual, size_t oldIndex) const noexcept
+{
+	const auto* row = dynamic_cast<const DataGridRow*>(&visual);
+	// A moved row that was under the pointer is corrected by the Window's
+	// post-preparation mouse-over resynchronization, exactly like a row that a
+	// scroll carries away from a stationary pointer.
+	if (!row || !row->GetVisualParent()) return false;
+	const auto* previous = std::exchange(DataGridAttachedRebindOwner, this);
+	const bool compatible = CanRecycleGeneratedItemAcrossIndices(
+		visual, oldIndex);
+	DataGridAttachedRebindOwner = previous;
+	return compatible;
+}
+
+bool DataGrid::TryRebindRealizedItemInPlace(
+	Control& visual,
+	size_t oldIndex,
+	size_t newIndex,
+	const BindingSourceReference& item,
+	BindingPathObservation& observation,
+	std::wstring* outError)
+{
+	// Reuse the complete cross-index rebind contract (and its virtual hook);
+	// only the detached-container precondition is relaxed for this call.
+	const auto* previous = std::exchange(DataGridAttachedRebindOwner, this);
+	const auto restore = MakeScopeExit([previous]
+	{
+		DataGridAttachedRebindOwner = previous;
+	});
+	return TryRebindGeneratedItemAcrossIndices(
+		visual, oldIndex, newIndex, item, observation, outError);
+}
+
 bool DataGrid::CanRecycleGeneratedItemAcrossIndices(
 	const Control& visual, size_t oldIndex) const noexcept
 {
 	const auto* row = dynamic_cast<const DataGridRow*>(&visual);
 	auto* mutableRow = const_cast<DataGridRow*>(row);
+	const bool attachedRebind = DataGridAttachedRebindOwner == this;
 	if (!row || row->GetDataGridOwner() != this
 		|| row->ItemIndex() != oldIndex
 		|| row->GetIsEditing()
-		|| row->GetVisualParent() || row->GetLogicalParent()
-		|| row->GetPresentationWindow()
+		|| (!attachedRebind
+			&& (row->GetVisualParent() || row->GetLogicalParent()
+				|| row->GetPresentationWindow()))
 		|| mutableRow->IsKeyboardFocusWithin
 		|| mutableRow->IsMouseCaptureWithin)
 		return false;

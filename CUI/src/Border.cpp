@@ -230,6 +230,36 @@ namespace
 		if (FAILED(sink->Close())) return {};
 		return geometry;
 	}
+
+	ComPtr<ID2D1PathGeometry> CachedBorderGeometry(
+		Border::GeometryCacheSlot& cache,
+		D2D1_RECT_F outerRect,
+		const BorderRadii& outerRadii,
+		const D2D1_RECT_F* innerRect,
+		const BorderRadii* innerRadii)
+	{
+		const bool hasInner = innerRect && innerRadii;
+		const D2D1_RECT_F inner = hasInner ? *innerRect : D2D1_RECT_F{};
+		const BorderRadii innerR = hasInner ? *innerRadii : BorderRadii{};
+		const std::array<float, 25> key{
+			outerRect.left, outerRect.top, outerRect.right, outerRect.bottom,
+			outerRadii.LeftTop, outerRadii.TopLeft, outerRadii.TopRight,
+			outerRadii.RightTop, outerRadii.RightBottom, outerRadii.BottomRight,
+			outerRadii.BottomLeft, outerRadii.LeftBottom,
+			hasInner ? 1.0f : 0.0f,
+			inner.left, inner.top, inner.right, inner.bottom,
+			innerR.LeftTop, innerR.TopLeft, innerR.TopRight, innerR.RightTop,
+			innerR.RightBottom, innerR.BottomRight, innerR.BottomLeft,
+			innerR.LeftBottom };
+		if (cache.Valid && cache.Geometry && cache.Key == key)
+			return cache.Geometry;
+		auto geometry = CreateBorderGeometry(
+			outerRect, outerRadii, innerRect, innerRadii);
+		cache.Key = key;
+		cache.Geometry = geometry;
+		cache.Valid = geometry != nullptr;
+		return geometry;
+	}
 }
 
 const DependencyProperty& Border::BorderBrushProperty()
@@ -432,7 +462,8 @@ void Border::OnRender()
 		if (innerRect.right > innerRect.left
 			&& innerRect.bottom > innerRect.top)
 		{
-			if (auto geometry = CreateBorderGeometry(
+			if (auto geometry = CachedBorderGeometry(
+				_backgroundGeometryCache,
 				innerRect, innerRadii, nullptr, nullptr))
 				graphics.FillGeometry(geometry.Get(), background);
 		}
@@ -441,7 +472,8 @@ void Border::OnRender()
 	if (auto* border = CreateBorderBrush(
 		graphics, D2D1_SIZE_F{ width, height }))
 	{
-		if (auto geometry = CreateBorderGeometry(
+		if (auto geometry = CachedBorderGeometry(
+			_borderGeometryCache,
 			outerRect, outerRadii, &innerRect, &innerRadii))
 			graphics.FillGeometry(geometry.Get(), border);
 		border->Release();

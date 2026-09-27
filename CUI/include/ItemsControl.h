@@ -298,6 +298,38 @@ protected:
 		if (outError) outError->clear();
 		return false;
 	}
+	/**
+	 * Opt-in in-place virtualization: moves a container that is still attached
+	 * to the virtual host to another item index. Detaching and re-attaching a
+	 * recycled container refreshes the inheritance/style context and presentation
+	 * window of its entire subtree twice and rebuilds the retained scene topology;
+	 * an in-place move only rebinds item state. The derived control proves the
+	 * container is safe to move and must leave it fully consistent on success;
+	 * on failure ItemsControl detaches and discards the container.
+	 */
+	virtual bool CanRebindRealizedItemInPlace(
+		const Control& visual, size_t oldIndex) const noexcept
+	{
+		(void)visual;
+		(void)oldIndex;
+		return false;
+	}
+	virtual bool TryRebindRealizedItemInPlace(
+		Control& visual,
+		size_t oldIndex,
+		size_t newIndex,
+		const BindingSourceReference& item,
+		BindingPathObservation& observation,
+		std::wstring* outError)
+	{
+		(void)visual;
+		(void)oldIndex;
+		(void)newIndex;
+		(void)item;
+		(void)observation;
+		if (outError) outError->clear();
+		return false;
+	}
 	/** Called before a rebuild prepares any replacement item containers. */
 	virtual void OnBeforeGeneratedItemsPrepared() {}
 	virtual void OnBeforeGeneratedItemsRebuilt() {}
@@ -542,6 +574,7 @@ private:
 	std::vector<CrossIndexRecycleCandidate> _virtualRecycleCandidatesScratch;
 	std::vector<size_t> _virtualAdditionIndicesScratch;
 	std::vector<size_t> _virtualRemovalIndicesScratch;
+	std::vector<size_t> _virtualInPlaceLeavingScratch;
 	bool _migratingAuthoredItems = false;
 	size_t _itemsSourceUpdateDepth = 0;
 	bool _itemsSourceReplacementInProgress = false;
@@ -587,6 +620,8 @@ private:
 	void RestoreVirtualCacheAfterVerticalThumbDrag();
 	bool RealizeVirtualRange(
 		size_t first, size_t last, bool localLayoutForScroll = false);
+	/** Moves one attached realized container; false leaves the normal path. */
+	bool TryReindexRealizedItemInPlace(size_t oldIndex, size_t newIndex);
 	std::pair<size_t, size_t> VirtualRangeForViewport() const noexcept;
 	std::pair<size_t, size_t> VirtualRangeForOffset(
 		double offset) const noexcept;

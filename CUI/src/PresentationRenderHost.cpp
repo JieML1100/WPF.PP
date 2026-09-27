@@ -1094,7 +1094,25 @@ bool PresentationRenderHost::ReplayDrawingCommands(
 {
 	if (!IsTransactionActive(transaction) || transaction.Failed
 		|| !presentationContext || !commandList) return false;
+	auto* context = presentationContext->GetDeviceContextRaw();
+	if (!context || (offset.x == 0.0f && offset.y == 0.0f))
+	{
+		presentationContext->DrawCommandList(commandList);
+		return true;
+	}
+	// A translated scene node replays its retained list displaced in render
+	// space. The list carries its recorded world transform, so applying the
+	// translation before the current target transform moves every primitive
+	// and recorded clip rigidly. Dropping the offset would present the node at
+	// its stale recorded position while its geometry reports the new one.
+	D2D1_MATRIX_3X2_F current{};
+	context->GetTransform(&current);
+	const auto displaced = D2D1::Matrix3x2F::Translation(offset.x, offset.y)
+		* D2D1::Matrix3x2F(current._11, current._12, current._21,
+			current._22, current._31, current._32);
+	context->SetTransform(displaced);
 	presentationContext->DrawCommandList(commandList);
+	context->SetTransform(current);
 	return true;
 }
 

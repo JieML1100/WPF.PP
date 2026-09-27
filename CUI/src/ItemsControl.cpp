@@ -1303,9 +1303,19 @@ namespace
 		}
 		double VerticalLayoutOriginDip() const noexcept override
 		{
-			if (_indices.empty()) return 0.0;
-			return _layoutOriginIndex < _itemCount
-				? ItemTop(_layoutOriginIndex) : 0.0;
+			if (_indices.empty() || _layoutOriginIndex >= _itemCount)
+				return 0.0;
+			// The origin only has to keep float layout coordinates small near the
+			// millionth record. Quantize it to a fixed band instead of tracking the
+			// first realized row: every virtualization step would otherwise move
+			// the origin, re-arrange every surviving row at a new relative offset
+			// and invalidate their complete visual subtrees although nothing on
+			// screen moved except the scroll translation. Within one band the
+			// realized rows stay below ~40k DIP, where float spacing is ~0.004 DIP.
+			constexpr double LayoutOriginBandDip = 32768.0;
+			const double top = ItemTop(_layoutOriginIndex);
+			if (!std::isfinite(top) || top <= LayoutOriginBandDip) return 0.0;
+			return std::floor(top / LayoutOriginBandDip) * LayoutOriginBandDip;
 		}
 		void OnVerticalThumbDragCompleted() override
 		{
@@ -2786,10 +2796,15 @@ void ItemsControl::RefreshItemsScrollOwner()
 				// retained scene presents one frame.  Presented controls consume only
 				// the newest range from PreparePresentation; detached controls keep
 				// synchronous realization for deterministic programmatic use/tests.
-				if (GetPresentationWindow() && _itemsScrollOwner
+				if (auto* window = GetPresentationWindow();
+					window && _itemsScrollOwner
 					&& _itemsScrollOwner->_lastScrollChangeWasInteractive)
 				{
 					_virtualRealizationPending = true;
+					// Realize before the next frame snapshots the retained scene,
+					// not from the scene traversal itself, so the entering rows are
+					// presented in the same frame as the new offset.
+					window->RequestPresentationPreparation(*this);
 					return;
 				}
 				(void)RealizeVirtualViewport(true);
@@ -5295,6 +5310,48 @@ bool ItemsControl::RealizeVirtualRange(
 	for (size_t index = first; index < last; ++index)
 		if (!_generator.ContainsRealized(index))
 			additionIndices.push_back(index);
+	// Move containers that leave the range directly onto entering indices while
+	// they stay attached. Only the remainder uses the detach/recycle-pool path,
+	// which re-propagates inheritance, styles and window ownership through every
+	// descendant and changes the retained scene topology.
+	size_t reindexedInPlace = 0;
+	if (virtualHost && !additionIndices.empty() && !IsGroupingActive())
+	{
+		const auto inPlaceSource = _itemsSource.Shared();
+		const size_t inPlaceSourceCount = _generator.SourceCount();
+		const size_t inPlaceRevision = _generatedItemsRevision;
+		auto& leaving = _virtualInPlaceLeavingScratch;
+		leaving.clear();
+		for (const auto& [index, realized] : _generator.RealizedItems())
+		{
+			(void)realized;
+			if (index < first || index >= last) leaving.push_back(index);
+		}
+		size_t leavingCursor = 0;
+		size_t write = 0;
+		for (size_t read = 0; read < additionIndices.size(); ++read)
+		{
+			const size_t target = additionIndices[read];
+			bool moved = false;
+			while (!moved && leavingCursor < leaving.size())
+			{
+				moved = TryReindexRealizedItemInPlace(
+					leaving[leavingCursor++], target);
+				auto* owner = dynamic_cast<ItemsControl*>(ownerLifetime.Get());
+				if (!owner || owner->_itemsSource.Shared() != inPlaceSource
+					|| owner->_generator.SourceCount() != inPlaceSourceCount
+					|| owner->_generatedItemsRevision != inPlaceRevision)
+					return false;
+			}
+			if (moved)
+			{
+				++reindexedInPlace;
+				continue;
+			}
+			additionIndices[write++] = target;
+		}
+		additionIndices.resize(write);
+	}
 	std::vector<PreparedItem> additions;
 	additions.reserve(additionIndices.size());
 	const auto preparedSource = _itemsSource.Shared();
@@ -5349,7 +5406,7 @@ bool ItemsControl::RealizeVirtualRange(
 		(void)item;
 		if (index < first || index >= last) removals.push_back(index);
 	}
-	if (additions.empty() && removals.empty())
+	if (additions.empty() && removals.empty() && reindexedInPlace == 0)
 	{
 		// PreparePresentation is evaluated for every retained frame.  A stable
 		// virtual range is not a tree mutation and must not invalidate measure;
@@ -5406,6 +5463,100 @@ bool ItemsControl::RealizeVirtualRange(
 		RequestLayout();
 	OnGeneratedItemsRealized();
 	return ownerLifetime.Get() != nullptr;
+}
+
+bool ItemsControl::TryReindexRealizedItemInPlace(
+	size_t oldIndex, size_t newIndex)
+{
+	auto* virtualHost = dynamic_cast<VirtualizingItemsHost*>(_itemsHost);
+	auto* visual = _generator.GetRealized(oldIndex);
+	if (!virtualHost || !visual || oldIndex == newIndex
+		|| _generator.ContainsRealized(newIndex)
+		|| UnwrapGeneratedItem(visual) != visual
+		|| visual->GetVisualParent() != _itemsHost
+		|| !CanRebindRealizedItemInPlace(*visual, oldIndex)) return false;
+	BindingSourceReference item;
+	if (!_itemsSource || !_itemsSource.Get()->TryGetItem(newIndex, item)
+		|| !item) return false;
+
+	const ControlWeakReference ownerLifetime(this);
+	const ControlWeakReference visualLifetime(visual);
+	const ControlWeakReference hostLifetime(virtualHost);
+	const auto source = _itemsSource.Shared();
+	const size_t sourceCount = _generator.SourceCount();
+	const size_t generatedRevision = _generatedItemsRevision;
+	auto resolveOwner = [&]() -> ItemsControl*
+	{
+		auto* live = dynamic_cast<ItemsControl*>(ownerLifetime.Get());
+		return live && live->_itemsSource.Shared() == source
+			&& live->_generator.SourceCount() == sourceCount
+			&& live->_generatedItemsRevision == generatedRevision
+			&& live->_itemsHost == hostLifetime.Get()
+			? live : nullptr;
+	};
+	// Same hook as the detach path: validation, details and UnloadingRow are
+	// published while the container still represents its old item.
+	OnGeneratedItemClearing(*visual);
+	auto* live = resolveOwner();
+	if (!live || visualLifetime.Get() != visual
+		|| live->_generator.GetRealized(oldIndex) != visual
+		|| live->_generator.ContainsRealized(newIndex)
+		|| visual->GetVisualParent() != live->_itemsHost) return false;
+
+	auto realized = live->_generator.TakeRealized(oldIndex);
+	auto discard = [&]()
+	{
+		// A partially rebound container must never stay in the committed tree.
+		auto* owner = dynamic_cast<ItemsControl*>(ownerLifetime.Get());
+		auto* liveVisual = visualLifetime.Get();
+		auto* host = dynamic_cast<VirtualizingItemsHost*>(hostLifetime.Get());
+		if (!owner || !liveVisual || !host) return;
+		host->UnregisterItem(liveVisual);
+		if (liveVisual->GetVisualParent() != host) return;
+		auto detached = host->DetachVisualChild(liveVisual);
+		if (!detached) return;
+		std::exception_ptr parentError;
+		(void)cui::framework::TreeAccess::
+			SetLogicalParentPreservingOwnership(
+				detached, nullptr, &parentError);
+	};
+	std::wstring error;
+	bool rebound = false;
+	try
+	{
+		rebound = live->TryRebindRealizedItemInPlace(
+			*visual, oldIndex, newIndex, item, realized.Observation, &error);
+	}
+	catch (...)
+	{
+		discard();
+		throw;
+	}
+	live = resolveOwner();
+	if (!live)
+	{
+		// The container is no longer tracked by the generator; a rebuild that
+		// raced with the rebind would otherwise leave it orphaned in the host.
+		discard();
+		return false;
+	}
+	if (!rebound || visualLifetime.Get() != visual
+		|| visual->GetVisualParent() != live->_itemsHost
+		|| live->_generator.ContainsRealized(newIndex))
+	{
+		discard();
+		return false;
+	}
+	auto* host = dynamic_cast<VirtualizingItemsHost*>(live->_itemsHost);
+	if (!host)
+	{
+		discard();
+		return false;
+	}
+	host->RegisterItem(visual, newIndex);
+	live->_generator.StoreRealized(
+		newIndex, visual, std::move(realized.Observation));
+	return true;
 }
 
 bool ItemsControl::RealizeVirtualViewport(

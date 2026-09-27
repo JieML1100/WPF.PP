@@ -8234,6 +8234,53 @@ bool Window::EnsureDCompInitialized()
 #endif
 }
 
+void Window::RequestPresentationPreparation(Control& control)
+{
+	VerifyAccess();
+	if (control.GetPresentationWindow() != this) return;
+	for (const auto& queued : _presentationPreparationQueue)
+		if (queued.Get() == &control) return;
+	_presentationPreparationQueue.emplace_back(&control);
+}
+
+bool Window::RunPresentationPreparation()
+{
+	if (_presentationPreparationQueue.empty() || this->IsLayoutSuspended())
+		return false;
+	// Preparation may queue further controls (a DataGrid realizing rows can
+	// request its own horizontal alignment). Swap first so re-entrant requests
+	// land in a fresh queue and are drained by this same bounded loop.
+	const ControlWeakReference windowLifetime(this);
+	bool ran = false;
+	for (size_t pass = 0; pass < 4u; ++pass)
+	{
+		auto* live = dynamic_cast<Window*>(windowLifetime.Get());
+		if (!live || live->_presentationPreparationQueue.empty()) break;
+		auto& work = live->_presentationPreparationScratch;
+		work.clear();
+		work.swap(live->_presentationPreparationQueue);
+		for (size_t index = 0; index < work.size(); ++index)
+		{
+			live = dynamic_cast<Window*>(windowLifetime.Get());
+			if (!live) return ran;
+			auto* control = live->_presentationPreparationScratch[index].Get();
+			if (!control || control->GetPresentationWindow() != live) continue;
+			cui::framework::PresentationAccess::Prepare(*control);
+			ran = true;
+		}
+		live = dynamic_cast<Window*>(windowLifetime.Get());
+		if (live) live->_presentationPreparationScratch.clear();
+	}
+	// Realization moved content under a stationary pointer (virtualized rows are
+	// re-indexed in place). Re-hit-test once so IsMouseOver/hover chrome follows
+	// the element now under the cursor instead of the one that scrolled away.
+	auto* live = dynamic_cast<Window*>(windowLifetime.Get());
+	if (ran && live && live->_mouseDirectlyOver
+		&& !live->GetMouseCaptured())
+		live->UpdateCursorFromCurrentMouse();
+	return ran;
+}
+
 void Window::InvalidatePresentationStructure() noexcept
 {
 	if (_presentationScene) _presentationScene->InvalidateStructure();
@@ -8899,6 +8946,15 @@ bool Window::UpdateDirtyRect(const RECT& dirty, bool force)
 	if (!_renderHost->PrimaryContext()) return false;
 	PresentationFrameTimingClock timingClock;
 	PresentationFrameTimingStatistics frameTiming;
+
+	// WM_PAINT normally drains this queue before collecting damage. Direct callers
+	// (settlement passes, tests) still converge here before the scene snapshot;
+	// any damage it queues schedules the following frame as before.
+	{
+		const ControlWeakReference windowLifetime(this);
+		(void)RunPresentationPreparation();
+		if (!windowLifetime.Get()) return false;
+	}
 
 	// Commit the root Content slot before the retained scene reads geometry.
 	if (!this->IsLayoutSuspended() && _contentLayoutPending)
@@ -10195,6 +10251,17 @@ LRESULT Window::HandlePlatformWindowMessage(
 				::BeginPaint(hWnd, &ps);
 				::EndPaint(hWnd, &ps);
 				return 0;
+			}
+			{
+				// Topology-changing preparation (virtualized rows realized for the
+				// newest scroll offset) must run before this paint collects damage and
+				// before the retained scene snapshots its nodes; otherwise the new rows
+				// are attached mid-frame and first appear one frame later as blanks.
+				const ControlWeakReference paintLifetime(form);
+				(void)form->RunPresentationPreparation();
+				form = dynamic_cast<Window*>(paintLifetime.Get());
+				if (!form || form->Handle != hWnd || ::IsWindow(hWnd) == FALSE)
+					return 0;
 			}
 			RECT pendingPaint{};
 			const bool hadPendingPaint =

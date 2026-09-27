@@ -2260,7 +2260,14 @@ void Control::SynchronizeVisualChildCollection(
 				? owner->_themeStyleSheet : child->_themeStyleSheet;
 			const auto styles = owner->_styleSheet
 				? owner->_styleSheet : child->_styleSheet;
-			if (!child->SetStyleEnvironment(theme, styles, true))
+			// A recycled virtualized container re-enters with the very same
+			// sheets it left with. SetVisualParentCore has already refreshed its
+			// inheritance context against the new ancestors, so repeating the
+			// recursive subscription/resource/style refresh for every descendant
+			// on each attach only multiplies the cost of scrolling.
+			if ((child->_themeStyleSheet != theme
+				|| child->_styleSheet != styles)
+				&& !child->SetStyleEnvironment(theme, styles, true))
 				throw std::runtime_error(
 					"Inherited Theme/Document style environment failed");
 		}
@@ -2467,6 +2474,42 @@ D2DGraphics* Control::GetDrawingContext() const noexcept
 	return window ? window->GetCurrentDrawingContext() : nullptr;
 }
 
+namespace
+{
+	bool TryPushAxisAlignedChildrenClip(
+		D2DGraphics& graphics,
+		D2D1_RECT_F rect,
+		const D2D1_MATRIX_3X2_F& transform)
+	{
+		auto* context = graphics.GetDeviceContextRaw();
+		if (!context || !std::isfinite(rect.left) || !std::isfinite(rect.top)
+			|| !std::isfinite(rect.right) || !std::isfinite(rect.bottom)
+			|| rect.right <= rect.left || rect.bottom <= rect.top
+			|| transform._12 != 0.0f || transform._21 != 0.0f
+			|| !std::isfinite(transform._11) || !std::isfinite(transform._22)
+			|| !std::isfinite(transform._31) || !std::isfinite(transform._32))
+			return false;
+		// Exact only while the device transform also preserves axes; otherwise
+		// Direct2D would clip to the transformed bounding box.
+		D2D1_MATRIX_3X2_F current{};
+		context->GetTransform(&current);
+		if (current._12 != 0.0f || current._21 != 0.0f) return false;
+		const float x0 = rect.left * transform._11 + transform._31;
+		const float x1 = rect.right * transform._11 + transform._31;
+		const float y0 = rect.top * transform._22 + transform._32;
+		const float y1 = rect.bottom * transform._22 + transform._32;
+		const D2D1_RECT_F local{
+			(std::min)(x0, x1), (std::min)(y0, y1),
+			(std::max)(x0, x1), (std::max)(y0, y1) };
+		if (!std::isfinite(local.left) || !std::isfinite(local.top)
+			|| !std::isfinite(local.right) || !std::isfinite(local.bottom))
+			return false;
+		// Popped by D2DGraphics::PopDrawRect (PopAxisAlignedClip) in EndRender.
+		context->PushAxisAlignedClip(local, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		return true;
+	}
+}
+
 void Control::BeginRender()
 {
 	auto renderSize = GetRenderSizeDip();
@@ -2523,8 +2566,22 @@ void Control::BeginRender(float clipW, float clipH)
 			* renderToLocal;
 		if (item.IsChildrenRectangle)
 		{
-			if (this->GetDrawingContext()->PushTransformedRectangleClip(
-				owner->GetVisualChildrenClipRect(), ownerToLocal))
+			const auto childrenClip = owner->GetVisualChildrenClipRect();
+			// Scrolling hosts and ClipToBounds panels are almost always
+			// axis-aligned. A layer here costs two factory geometries while
+			// recording and an intermediate mask on every retained replay, so
+			// prefer the exact axis-aligned clip. Isolated recordings keep the
+			// layer: they may be replayed under an animated rotation.
+			if (!clipSuppressionRoot && _activeGeometryClipCount < 64u
+				&& TryPushAxisAlignedChildrenClip(
+					*this->GetDrawingContext(), childrenClip, ownerToLocal))
+			{
+				_activeAxisAlignedClipMask |=
+					uint64_t{ 1 } << _activeGeometryClipCount;
+				++_activeGeometryClipCount;
+			}
+			else if (this->GetDrawingContext()->PushTransformedRectangleClip(
+				childrenClip, ownerToLocal))
 				++_activeGeometryClipCount;
 			continue;
 		}
@@ -2748,6 +2805,21 @@ void Control::SetRenderTransformOriginDip(cui::core::Point origin)
 	InvalidatePresentationTransformSubtree();
 	InvalidateVisualBoundsSubtree();
 }
+bool Control::TryCompleteEmptyRender()
+{
+#if CUI_ENABLE_DYNAMIC_XAML
+	if (_declarativeComponentBehavior) return false;
+#endif
+	// Mirrors EndRender's bookkeeping. The retained scene records an empty list
+	// for this node; skipping BeginRender avoids walking every ancestor for a
+	// transform and pushing one clip per ancestor around zero primitives.
+	_activeGeometryClipCount = 0;
+	_activeAxisAlignedClipMask = 0;
+	this->_layoutState.CommitPaint();
+	_hasLastInvalidatedClientRect = false;
+	return true;
+}
+
 void Control::EndRender()
 {
 	if (!this->GetPresentationWindow() || !this->GetDrawingContext()) return;

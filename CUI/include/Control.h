@@ -1341,6 +1341,12 @@ protected:
 	void BeginRender(float clipW, float clipH);
 	void EndRender();
 	/**
+	 * Completes an OnRender that produces no pixels without the ancestor
+	 * transform/clip walk of BeginRender. Returns false when an attached
+	 * declarative overlay still has to draw; the caller then renders normally.
+	 */
+	bool TryCompleteEmptyRender();
+	/**
 	 * Invalidates cached geometry for this visual and every retained descendant.
 	 * Containers call this when their render-only child offset/transform changes
 	 * without a new layout pass.

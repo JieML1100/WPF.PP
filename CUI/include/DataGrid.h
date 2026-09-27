@@ -1980,6 +1980,15 @@ protected:
 		const BindingSourceReference& item,
 		BindingPathObservation& observation,
 		std::wstring* outError) override;
+	bool CanRebindRealizedItemInPlace(
+		const Control& visual, size_t oldIndex) const noexcept override;
+	bool TryRebindRealizedItemInPlace(
+		Control& visual,
+		size_t oldIndex,
+		size_t newIndex,
+		const BindingSourceReference& item,
+		BindingPathObservation& observation,
+		std::wstring* outError) override;
 	void OnBeforeGeneratedItemsPrepared() override;
 	void OnGeneratedItemClearing(Control& visual) override;
 	void OnGeneratedItemsRebuilt() override;
