@@ -1729,6 +1729,27 @@ protected:
 	/** Framework-only propagation of the current Window presentation source. */
 	static void PropagatePresentationWindow(
 		Control* control, PresentationWindow* window);
+	/**
+	 * Moves visual subtrees between two parents of the same Window without a
+	 * transient "no Window" state. While a scope is active, a subtree detached
+	 * from its visual parent keeps its presentation window; when it is attached
+	 * again under the same Window, the per-descendant window propagation (and the
+	 * measure invalidation it implies for the whole subtree) is skipped. Subtrees
+	 * still detached when the outermost scope ends are released normally.
+	 */
+	/** Completes an attach for a subtree kept alive by the transfer scope. */
+	static bool CompletePendingPresentationWindowTransfer(
+		Control& child, PresentationWindow* window);
+	class ScopedPresentationWindowTransfer final
+	{
+	public:
+		ScopedPresentationWindowTransfer() noexcept;
+		~ScopedPresentationWindowTransfer();
+		ScopedPresentationWindowTransfer(
+			const ScopedPresentationWindowTransfer&) = delete;
+		ScopedPresentationWindowTransfer& operator=(
+			const ScopedPresentationWindowTransfer&) = delete;
+	};
 	/** Called after this element and its visual descendants enter/leave a Window. */
 	virtual void OnPresentationWindowChanged(
 		PresentationWindow* previousWindow,

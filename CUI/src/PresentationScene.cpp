@@ -556,6 +556,7 @@ void PresentationScene::SynchronizeResourceGeneration(
 {
 	if (generation == 0 || generation == _resourceGeneration) return;
 	_resourceGeneration = generation;
+	_dormantCommands.clear();
 	for (auto& node : _nodes)
 	{
 		if (node.DrawingCommands)
@@ -598,30 +599,11 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 	// Fold every range queued before the topology changed into the old nodes so
 	// the carried dirty state below is exact for the previous structure.
 	ApplyPendingGeometryInvalidations();
-	struct RetainedCommandCache
-	{
-		const Control* VisualParent = nullptr;
-		Microsoft::WRL::ComPtr<ID2D1CommandList> DrawingCommands;
-		uint64_t CommandGeneration = 0;
-		PresentationRevisionSnapshot AppliedRevisions{};
-		D2D1_RECT_F RenderedBounds{};
-		bool HasGeometry = false;
-		bool ContentDirty = true;
-		bool GeometryDirty = true;
-		bool CompositionDirty = true;
-		bool TranslationReplayable = false;
-		D2D1_MATRIX_3X2_F RecordedTransform{
-			1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
-		D2D1_SIZE_F RecordedRenderSize{};
-		D2D1_SIZE_F RecordedActualSize{};
-		int RecordedTitleBarOffset = 0;
-		D2D1_POINT_2F ReplayOffset{};
-	};
-	// Realizing one virtualized row changes the visual topology. Rebuilding the
-	// retained scene is structural bookkeeping only: ordinary nodes that survive
-	// under the same visual parent keep their command lists, and the revision
-	// walk at the end re-derives which of them moved while topology was dirty.
-	std::unordered_map<const Control*, RetainedCommandCache> retainedCommands;
+	// Dormant entries (nodes that left an earlier topology, e.g. a hidden tab
+	// page) are candidates too; entries from the scene being replaced win.
+	std::unordered_map<const Control*, RetainedCommandCache> retainedCommands =
+		std::move(_dormantCommands);
+	_dormantCommands.clear();
 	size_t previousCommandLists = 0;
 	for (auto& node : _nodes)
 	{
@@ -635,6 +617,8 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 			|| !_segments[node.SegmentIndex].GeometryRasterMembers.empty())
 			continue;
 		RetainedCommandCache cache;
+		cache.Element = node.Element;
+		cache.Dormant = false;
 		cache.VisualParent = node.VisualParent;
 		cache.DrawingCommands = std::move(node.DrawingCommands);
 		cache.CommandGeneration = node.CommandGeneration;
@@ -650,7 +634,7 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 		cache.RecordedActualSize = node.RecordedActualSize;
 		cache.RecordedTitleBarOffset = node.RecordedTitleBarOffset;
 		cache.ReplayOffset = node.ReplayOffset;
-		retainedCommands.emplace(control, std::move(cache));
+		retainedCommands.insert_or_assign(control, std::move(cache));
 	}
 	_nodes.clear();
 	_segments.clear();
@@ -1271,6 +1255,7 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 	// geometry revision while structure invalidation suppressed range tracking;
 	// that covers every ancestor transform, offset or clip a list bakes in.
 	size_t retainedCount = 0;
+	size_t retainedFromPrevious = 0;
 	if (!retainedCommands.empty())
 	{
 		struct DirtyScope
@@ -1292,10 +1277,17 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 				? retainedCommands.find(control) : retainedCommands.end();
 			bool geometryDirty = true;
 			if (found != retainedCommands.end()
+				&& found->second.DrawingCommands
+				&& found->second.Element.Get() == control
 				&& found->second.VisualParent == node.VisualParent)
 			{
 				auto& cache = found->second;
-				geometryDirty = inheritedDirty || cache.GeometryDirty
+				// A dormant node missed every range invalidation while it was out
+				// of the scene (its ancestors may have moved, resized or changed
+				// clips). Always re-validate its geometry; the translation check
+				// then proves transform, size and clip before reusing the list.
+				geometryDirty = cache.Dormant || inheritedDirty
+					|| cache.GeometryDirty
 					|| control->GetPresentationRevisions().Geometry
 						!= cache.AppliedRevisions.Geometry;
 				const bool adoptable = !node.Overlay && !node.NativeComposition
@@ -1322,13 +1314,30 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 					node.RecordedTitleBarOffset = cache.RecordedTitleBarOffset;
 					node.ReplayOffset = cache.ReplayOffset;
 					++retainedCount;
+					if (!cache.Dormant) ++retainedFromPrevious;
 				}
 			}
 			scopes.push_back({
 				(std::min)(node.SubtreeEnd, _nodes.size()), geometryDirty });
 		}
 	}
-	_pendingCommandCacheInvalidations += previousCommandLists - retainedCount;
+	// Park the command lists of ordinary nodes that left the scene but are still
+	// alive, so re-showing the same subtree (switching back to a tab page) can
+	// replay instead of re-recording every element. Bounded; overflow is simply
+	// re-recorded later.
+	size_t parked = 0;
+	for (auto& [control, cache] : retainedCommands)
+	{
+		if (!cache.DrawingCommands || cache.Element.Get() != control
+			|| _nodeIndex.contains(const_cast<Control*>(control))
+			|| _dormantCommands.size() >= MaxDormantCommandLists) continue;
+		if (!cache.Dormant) ++parked;
+		cache.Dormant = true;
+		_dormantCommands.emplace(control, std::move(cache));
+	}
+	const size_t leftPrevious = previousCommandLists
+		- (std::min)(previousCommandLists, retainedFromPrevious + parked);
+	_pendingCommandCacheInvalidations += leftPrevious;
 	_pendingCommandCacheRetentions += retainedCount;
 }
 

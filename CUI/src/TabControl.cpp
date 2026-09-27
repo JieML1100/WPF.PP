@@ -1120,6 +1120,9 @@ void TabControl::RestoreProjectedVisualContent()
 		}
 	} restoreScope(
 		*this, _restoringContentProjection, _synchronizingContentProjection);
+	// The page moves from the central host back to its TabItem inside the same
+	// Window; keep its presentation source (and layout caches) across the move.
+	const ScopedPresentationWindowTransfer windowTransfer;
 	const ControlWeakReference ownerLifetime(this);
 
 	auto* host = dynamic_cast<ContentPresenter*>(
@@ -1230,6 +1233,11 @@ void TabControl::SynchronizeSelectedContentHost()
 		return;
 	}
 	_synchronizingContentProjection = true;
+	// Page visuals move between their TabItem and PART_SelectedContentHost,
+	// both inside this Window. Without a transfer scope every switch would walk
+	// both complete pages twice (Window released, then re-acquired) and discard
+	// every descendant's measure cache.
+	const ScopedPresentationWindowTransfer windowTransfer;
 	const ControlWeakReference ownerLifetime(this);
 	try
 	{
