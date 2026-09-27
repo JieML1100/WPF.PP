@@ -32,12 +32,12 @@
           <ArcSegment Point="12,0" Size="12,12" SweepDirection="Clockwise"/>
         </PathFigure>
         <Geometry.Transform>
-          <ScaleTransform ScaleX="0.99000001" ScaleY="0.939999998" CenterX="220" CenterY="17"/>
+          <ScaleTransform ScaleX="0.99" ScaleY="0.94" CenterX="220" CenterY="17"/>
         </Geometry.Transform>
       </PathGeometry>
       <TransformGroup x:Key="GradientLabelTransform">
         <RotateTransform Angle="-2"/>
-        <ScaleTransform ScaleX="1.01999998" ScaleY="1.01999998"/>
+        <ScaleTransform ScaleX="1.02" ScaleY="1.02"/>
       </TransformGroup>
       <TransformGroup x:Key="WebBrowserCompositionTransform">
         <ScaleTransform ScaleX="0.75" ScaleY="0.75"/>
@@ -1354,8 +1354,8 @@
                 <Control.Foreground>
                   <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
                     <GradientStop Color="#FFE30940" Offset="0"/>
-                    <GradientStop Color="#FFE7D702" Offset="0.330000013"/>
-                    <GradientStop Color="#FF0FA895" Offset="0.660000026"/>
+                    <GradientStop Color="#FFE7D702" Offset="0.33"/>
+                    <GradientStop Color="#FF0FA895" Offset="0.66"/>
                     <GradientStop Color="#FF1373E8" Offset="1"/>
                   </LinearGradientBrush>
                 </Control.Foreground>
@@ -1363,10 +1363,10 @@
               <TextBlock x:Name="gradientLabel" Margin="0,12,0,12" Height="34" Padding="12,0,12,0"
                 Style="{StaticResource ResourceGeometryVisual}" Text="画刷、裁剪与变换均由 XAML 表达" RenderTransformOrigin="0.5,0.5">
                 <Control.Foreground>
-                  <RadialGradientBrush Center="0.5,0.5" GradientOrigin="0.200000003,0.200000003" RadiusX="0.699999988" RadiusY="0.899999976">
+                  <RadialGradientBrush Center="0.5,0.5" GradientOrigin="0.2,0.2" RadiusX="0.7" RadiusY="0.9">
                     <GradientStop Color="#FFE30940" Offset="0"/>
-                    <GradientStop Color="#FFE7D702" Offset="0.330000013"/>
-                    <GradientStop Color="#FF0FA895" Offset="0.660000026"/>
+                    <GradientStop Color="#FFE7D702" Offset="0.33"/>
+                    <GradientStop Color="#FF0FA895" Offset="0.66"/>
                     <GradientStop Color="#FF1373E8" Offset="1"/>
                   </RadialGradientBrush>
                 </Control.Foreground>

@@ -68,6 +68,11 @@ namespace cui::framework
 			return target.GetRenderedAbsoluteRectDipForRecording();
 		}
 
+		static cui::core::Size RenderSize(Control& target)
+		{
+			return target.GetRenderSizeDip();
+		}
+
 		static bool BreaksVisualPresentationInheritance(
 			const Control& target) noexcept
 		{

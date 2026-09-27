@@ -80,9 +80,7 @@ Binding、DynamicResource、TemplateBinding 和 Animation 都保存在属性值�
 
 ## 构建环境
 
-完整矩阵需要 Visual Studio 2026（MSBuild 18）、Windows SDK、MSVC v145，以及 Win32 项目使用的
-v143 工具集。首次构建前请通过 Visual Studio 恢复 `CUI/packages.config` 和
-`CUITest/packages.config` 中声明的 WebView2 NuGet 包。
+完整矩阵需要 Windows SDK、MSVC。
 
 以下 PowerShell 片段不依赖 Visual Studio 的 edition 或安装目录：
 

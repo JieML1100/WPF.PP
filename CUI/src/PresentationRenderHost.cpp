@@ -1089,7 +1089,8 @@ bool PresentationRenderHost::RecordDrawingCommands(
 bool PresentationRenderHost::ReplayDrawingCommands(
 	FrameTransaction& transaction,
 	D2DGraphics* presentationContext,
-	ID2D1CommandList* commandList) noexcept
+	ID2D1CommandList* commandList,
+	D2D1_POINT_2F offset) noexcept
 {
 	if (!IsTransactionActive(transaction) || transaction.Failed
 		|| !presentationContext || !commandList) return false;

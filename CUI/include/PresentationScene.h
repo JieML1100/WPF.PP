@@ -158,6 +158,23 @@ private:
 		D2D1_RECT_F RenderedBounds{};
 		Microsoft::WRL::ComPtr<ID2D1CommandList> DrawingCommands;
 		uint64_t CommandGeneration = 0;
+		/**
+		 * Rigid-translation reuse of DrawingCommands for ordinary (non-isolated)
+		 * nodes. A node qualifies when no ancestor clip touched its pixels at
+		 * recording time; while that remains true and only the translation of
+		 * its local-to-render transform changes (scrolling, virtualized row
+		 * rebasing), the retained list is replayed displaced by ReplayOffset
+		 * instead of calling OnRender again.
+		 */
+		bool TranslationReplayable = false;
+		D2D1_MATRIX_3X2_F RecordedTransform{
+			1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+		D2D1_SIZE_F RecordedRenderSize{};
+		D2D1_SIZE_F RecordedActualSize{};
+		int RecordedTitleBarOffset = 0;
+		D2D1_POINT_2F ReplayOffset{};
+		/** Visual parent at topology build time; compared only, never dereferenced. */
+		const Control* VisualParent = nullptr;
 	};
 
 	struct Segment
@@ -273,6 +290,7 @@ private:
 	uint64_t _frameSequence = 0;
 	uint64_t _resourceGeneration = 0;
 	size_t _pendingCommandCacheInvalidations = 0;
+	size_t _pendingCommandCacheRetentions = 0;
 	uint64_t _preparedRevision = 0;
 	bool _hasPreparedRevision = false;
 	PresentationFrameStatistics _frameStatistics;

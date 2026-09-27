@@ -179,6 +179,88 @@ namespace
 		return result.right > result.left && result.bottom > result.top;
 	}
 
+	bool AxisPreserving(const D2D1_MATRIX_3X2_F& value) noexcept
+	{
+		return value._12 == 0.0f && value._21 == 0.0f
+			&& std::isfinite(value._11) && std::isfinite(value._22)
+			&& std::isfinite(value._31) && std::isfinite(value._32);
+	}
+
+	struct TranslationReplayState
+	{
+		D2D1_MATRIX_3X2_F Transform{
+			1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+		D2D1_SIZE_F RenderSize{};
+		D2D1_SIZE_F ActualSize{};
+	};
+
+	/**
+	 * Captures the state that makes a node's recorded commands a rigid function
+	 * of its translation. Control::BeginRender bakes the complete ancestor clip
+	 * chain into every command list; such a list can only be displaced when all
+	 * of those clips are no-ops for the node's pixels. Every node draws inside
+	 * its own (0, 0, render size) box, so containment of that box inside each
+	 * axis-aligned ancestor children-clip proves the clip had no effect. Explicit
+	 * Geometry clips and presentation-inheritance boundaries fail closed.
+	 */
+	bool TryCaptureTranslationReplayState(
+		Control& control,
+		TranslationReplayState& state)
+	{
+		if (cui::framework::PresentationAccess::
+			BreaksVisualPresentationInheritance(control)
+			|| control.GetClip()) return false;
+		state.Transform = control.GetLocalToRenderTransform();
+		const auto renderSize =
+			cui::framework::PresentationAccess::RenderSize(control);
+		const auto actualSize = control.GetActualSizeDip();
+		state.RenderSize = D2D1::SizeF(renderSize.width, renderSize.height);
+		state.ActualSize = D2D1::SizeF(actualSize.width, actualSize.height);
+		if (!AxisPreserving(state.Transform)
+			|| !std::isfinite(renderSize.width)
+			|| !std::isfinite(renderSize.height)
+			|| !std::isfinite(actualSize.width)
+			|| !std::isfinite(actualSize.height)) return false;
+		const auto bounds = TransformBounds(D2D1::RectF(
+			0.0f, 0.0f,
+			(std::max)(0.0f, (std::max)(renderSize.width, actualSize.width)),
+			(std::max)(0.0f, (std::max)(renderSize.height, actualSize.height))),
+			state.Transform);
+		constexpr float tolerance = 0.01f;
+		size_t depth = 0;
+		for (auto* ancestor = control.GetVisualParent(); ancestor;
+			ancestor = ancestor->GetVisualParent())
+		{
+			if (++depth > 4096u
+				|| cui::framework::PresentationAccess::
+					BreaksVisualPresentationInheritance(*ancestor)
+				|| ancestor->GetClip()) return false;
+			if (!ancestor->ClipsChildren()) continue;
+			const auto ownerToRender = ancestor->GetLocalToRenderTransform();
+			if (!AxisPreserving(ownerToRender)) return false;
+			const auto clip = TransformBounds(
+				ancestor->GetVisualChildrenClipRect(), ownerToRender);
+			if (!(bounds.left >= clip.left - tolerance
+				&& bounds.top >= clip.top - tolerance
+				&& bounds.right <= clip.right + tolerance
+				&& bounds.bottom <= clip.bottom + tolerance)) return false;
+		}
+		return true;
+	}
+
+	bool SameLinearPart(
+		const D2D1_MATRIX_3X2_F& left,
+		const D2D1_MATRIX_3X2_F& right) noexcept
+	{
+		return left._11 == right._11 && left._12 == right._12
+			&& left._21 == right._21 && left._22 == right._22;
+	}
+
+	bool SameSize(D2D1_SIZE_F left, D2D1_SIZE_F right) noexcept
+	{
+		return left.width == right.width && left.height == right.height;
+	}
+
 	struct AncestorRectangleClip
 	{
 		D2D1_RECT_F LocalRect{};
@@ -513,9 +595,63 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 			}),
 		_rasterRoots.end());
 
-	_pendingCommandCacheInvalidations += static_cast<size_t>(std::count_if(
-		_nodes.begin(), _nodes.end(), [](const Node& node)
-		{ return node.DrawingCommands != nullptr; }));
+	// Fold every range queued before the topology changed into the old nodes so
+	// the carried dirty state below is exact for the previous structure.
+	ApplyPendingGeometryInvalidations();
+	struct RetainedCommandCache
+	{
+		const Control* VisualParent = nullptr;
+		Microsoft::WRL::ComPtr<ID2D1CommandList> DrawingCommands;
+		uint64_t CommandGeneration = 0;
+		PresentationRevisionSnapshot AppliedRevisions{};
+		D2D1_RECT_F RenderedBounds{};
+		bool HasGeometry = false;
+		bool ContentDirty = true;
+		bool GeometryDirty = true;
+		bool CompositionDirty = true;
+		bool TranslationReplayable = false;
+		D2D1_MATRIX_3X2_F RecordedTransform{
+			1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+		D2D1_SIZE_F RecordedRenderSize{};
+		D2D1_SIZE_F RecordedActualSize{};
+		int RecordedTitleBarOffset = 0;
+		D2D1_POINT_2F ReplayOffset{};
+	};
+	// Realizing one virtualized row changes the visual topology. Rebuilding the
+	// retained scene is structural bookkeeping only: ordinary nodes that survive
+	// under the same visual parent keep their command lists, and the revision
+	// walk at the end re-derives which of them moved while topology was dirty.
+	std::unordered_map<const Control*, RetainedCommandCache> retainedCommands;
+	size_t previousCommandLists = 0;
+	for (auto& node : _nodes)
+	{
+		if (!node.DrawingCommands) continue;
+		++previousCommandLists;
+		auto* control = node.Element.Get();
+		if (!control || !node.HasPresented || node.Overlay
+			|| node.NativeComposition || node.CompositionIsolated
+			|| node.SegmentIndex >= _segments.size()
+			|| _segments[node.SegmentIndex].IsolationRoot
+			|| !_segments[node.SegmentIndex].GeometryRasterMembers.empty())
+			continue;
+		RetainedCommandCache cache;
+		cache.VisualParent = node.VisualParent;
+		cache.DrawingCommands = std::move(node.DrawingCommands);
+		cache.CommandGeneration = node.CommandGeneration;
+		cache.AppliedRevisions = node.AppliedRevisions;
+		cache.RenderedBounds = node.RenderedBounds;
+		cache.HasGeometry = node.HasGeometry;
+		cache.ContentDirty = node.ContentDirty;
+		cache.GeometryDirty = node.GeometryDirty;
+		cache.CompositionDirty = node.CompositionDirty;
+		cache.TranslationReplayable = node.TranslationReplayable;
+		cache.RecordedTransform = node.RecordedTransform;
+		cache.RecordedRenderSize = node.RecordedRenderSize;
+		cache.RecordedActualSize = node.RecordedActualSize;
+		cache.RecordedTitleBarOffset = node.RecordedTitleBarOffset;
+		cache.ReplayOffset = node.ReplayOffset;
+		retainedCommands.emplace(control, std::move(cache));
+	}
 	_nodes.clear();
 	_segments.clear();
 	_opacityGroups.clear();
@@ -562,6 +698,7 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 		node.NativeComposition = native;
 		node.Overlay = overlay;
 		node.AppliedRevisions = {};
+		node.VisualParent = control->GetVisualParent();
 		_nodes.push_back(std::move(node));
 		_nodeIndex.emplace(control, nodeIndex);
 		for (auto* child : SortedVisibleChildren(control))
@@ -1128,6 +1265,71 @@ void PresentationScene::Rebuild(std::span<Control* const> roots)
 			_opacityGroups[owner].NativeMembers.push_back({
 				ControlWeakReference(nativeRoot), node.Order });
 	}
+
+	// Adopt retained command lists in pre-order. A node inherits geometry
+	// dirtiness from any ancestor that is new, was already dirty or published a
+	// geometry revision while structure invalidation suppressed range tracking;
+	// that covers every ancestor transform, offset or clip a list bakes in.
+	size_t retainedCount = 0;
+	if (!retainedCommands.empty())
+	{
+		struct DirtyScope
+		{
+			size_t End = 0;
+			bool GeometryDirty = false;
+		};
+		std::vector<DirtyScope> scopes;
+		scopes.reserve(32u);
+		for (size_t index = 0; index < _nodes.size(); ++index)
+		{
+			while (!scopes.empty() && index >= scopes.back().End)
+				scopes.pop_back();
+			const bool inheritedDirty = !scopes.empty()
+				&& scopes.back().GeometryDirty;
+			auto& node = _nodes[index];
+			auto* control = node.Element.Get();
+			const auto found = control
+				? retainedCommands.find(control) : retainedCommands.end();
+			bool geometryDirty = true;
+			if (found != retainedCommands.end()
+				&& found->second.VisualParent == node.VisualParent)
+			{
+				auto& cache = found->second;
+				geometryDirty = inheritedDirty || cache.GeometryDirty
+					|| control->GetPresentationRevisions().Geometry
+						!= cache.AppliedRevisions.Geometry;
+				const bool adoptable = !node.Overlay && !node.NativeComposition
+					&& !node.CompositionIsolated
+					&& node.SegmentIndex < _segments.size()
+					&& !_segments[node.SegmentIndex].IsolationRoot
+					&& _segments[node.SegmentIndex].GeometryRasterMembers.empty();
+				if (adoptable)
+				{
+					node.DrawingCommands = std::move(cache.DrawingCommands);
+					node.CommandGeneration = cache.CommandGeneration;
+					node.AppliedRevisions = cache.AppliedRevisions;
+					node.RenderedBounds = cache.RenderedBounds;
+					node.HasGeometry = cache.HasGeometry;
+					node.HasPresented = true;
+					node.ContentDirty = cache.ContentDirty;
+					node.GeometryDirty = geometryDirty;
+					node.TransformOnlyGeometryDirty = false;
+					node.CompositionDirty = cache.CompositionDirty;
+					node.TranslationReplayable = cache.TranslationReplayable;
+					node.RecordedTransform = cache.RecordedTransform;
+					node.RecordedRenderSize = cache.RecordedRenderSize;
+					node.RecordedActualSize = cache.RecordedActualSize;
+					node.RecordedTitleBarOffset = cache.RecordedTitleBarOffset;
+					node.ReplayOffset = cache.ReplayOffset;
+					++retainedCount;
+				}
+			}
+			scopes.push_back({
+				(std::min)(node.SubtreeEnd, _nodes.size()), geometryDirty });
+		}
+	}
+	_pendingCommandCacheInvalidations += previousCommandLists - retainedCount;
+	_pendingCommandCacheRetentions += retainedCount;
 }
 
 void PresentationScene::BeginFrameStatistics() noexcept
@@ -1138,6 +1340,9 @@ void PresentationScene::BeginFrameStatistics() noexcept
 	_frameStatistics.CommandCacheInvalidatedNodes =
 		_pendingCommandCacheInvalidations;
 	_pendingCommandCacheInvalidations = 0;
+	_frameStatistics.CommandCacheRetainedNodes =
+		_pendingCommandCacheRetentions;
+	_pendingCommandCacheRetentions = 0;
 }
 
 bool PresentationScene::RefreshNodeState(Node& node)
@@ -2542,12 +2747,51 @@ bool PresentationScene::RenderComposition(
 		if (transformOnlyGeometry)
 			++_frameStatistics.CompositionTransformOnlyNodes;
 		const auto submitted = control->GetPresentationRevisions();
-		const bool needsRecording = !node.DrawingCommands
+		bool needsRecording = !node.DrawingCommands
 			|| node.CommandGeneration != transaction.ResourceGeneration
 			|| contentDirtyNode
 			|| (geometryDirtyNode && !transformOnlyGeometry);
+		// Ordinary content segments replay in fixed root space. Scrolling and
+		// virtualized row rebasing only translate their descendants, so a node
+		// whose retained pixels were never clipped by an ancestor can be moved
+		// rigidly instead of re-running OnRender for every visible element.
+		const bool ordinaryReplaySegment = activePropertiesSegment
+			&& !activePropertiesSegment->IsolationRoot
+			&& activePropertiesSegment->GeometryRasterMembers.empty()
+			&& !node.Overlay && !node.CompositionIsolated;
+		if (needsRecording && ordinaryReplaySegment
+			&& node.TranslationReplayable && node.DrawingCommands
+			&& node.CommandGeneration == transaction.ResourceGeneration
+			&& !contentDirtyNode && geometryDirtyNode
+			&& node.RecordedTitleBarOffset == titleBarOffset)
+		{
+			TranslationReplayState current;
+			if (TryCaptureTranslationReplayState(*control, current)
+				&& SameLinearPart(current.Transform, node.RecordedTransform)
+				&& SameSize(current.RenderSize, node.RecordedRenderSize)
+				&& SameSize(current.ActualSize, node.RecordedActualSize))
+			{
+				node.ReplayOffset = D2D1::Point2F(
+					current.Transform._31 - node.RecordedTransform._31,
+					current.Transform._32 - node.RecordedTransform._32);
+				needsRecording = false;
+				++_frameStatistics.CommandTranslatedNodes;
+			}
+		}
+		control = node.Element.Get();
+		if (!control) continue;
 		if (needsRecording)
 		{
+			TranslationReplayState recordedState;
+			node.TranslationReplayable = ordinaryReplaySegment
+				&& TryCaptureTranslationReplayState(*control, recordedState);
+			node.RecordedTransform = recordedState.Transform;
+			node.RecordedRenderSize = recordedState.RenderSize;
+			node.RecordedActualSize = recordedState.ActualSize;
+			node.RecordedTitleBarOffset = titleBarOffset;
+			node.ReplayOffset = {};
+			control = node.Element.Get();
+			if (!control) continue;
 			Microsoft::WRL::ComPtr<ID2D1CommandList> commands;
 			const ControlWeakReference renderTarget(control);
 			const Segment* recordingSegment = node.SegmentIndex < _segments.size()
@@ -2600,6 +2844,12 @@ bool PresentationScene::RenderComposition(
 				recordClock.ElapsedMicroseconds();
 			if (!recorded)
 			{
+				// The translation baseline above already describes the failed
+				// recording; never pair it with the previous command list.
+				node.DrawingCommands.Reset();
+				node.CommandGeneration = 0;
+				node.TranslationReplayable = false;
+				node.ReplayOffset = {};
 				frameHealthy = false;
 				break;
 			}
@@ -2652,7 +2902,8 @@ bool PresentationScene::RenderComposition(
 		}
 		const SceneWorkClock replayClock;
 		const bool replayed = host.ReplayDrawingCommands(
-			transaction, segmentContext, node.DrawingCommands.Get());
+			transaction, segmentContext, node.DrawingCommands.Get(),
+			ordinaryReplaySegment ? node.ReplayOffset : D2D1_POINT_2F{});
 		_frameStatistics.SceneCommandReplayMicroseconds +=
 			replayClock.ElapsedMicroseconds();
 		if (replaySegment && replaySegment->RasterizesAncestorGeometryClip)

@@ -2475,6 +2475,7 @@ void Control::BeginRender()
 void Control::BeginRender(float clipW, float clipH)
 {
 	_activeGeometryClipCount = 0;
+	_activeAxisAlignedClipMask = 0;
 	if (!this->GetPresentationWindow() || !this->GetDrawingContext()) return;
 	const float titleBarOffset = static_cast<float>(
 		this->GetPresentationWindow()->GetTitleBarHeightDip());
@@ -2765,9 +2766,14 @@ void Control::EndRender()
 #endif
 	while (_activeGeometryClipCount > 0)
 	{
-		this->GetDrawingContext()->PopGeometryClip();
 		--_activeGeometryClipCount;
+		const bool axisAligned = _activeGeometryClipCount < 64u
+			&& (_activeAxisAlignedClipMask
+				& (uint64_t{ 1 } << _activeGeometryClipCount)) != 0u;
+		if (axisAligned) this->GetDrawingContext()->PopDrawRect();
+		else this->GetDrawingContext()->PopGeometryClip();
 	}
+	_activeAxisAlignedClipMask = 0;
 	this->GetDrawingContext()->PopLocalTransform();
 	this->_layoutState.CommitPaint();
 	// The previous invalidation is only a coalescing aid while a visual is

@@ -87,9 +87,7 @@ gallery.
 
 ## Build requirements
 
-The full matrix requires Visual Studio 2026 (MSBuild 18), a Windows SDK, MSVC v145, and the v143 toolset
-used by the Win32 projects. Before the first build, use Visual Studio to restore the WebView2 NuGet package
-declared in `CUI/packages.config` and `CUITest/packages.config`.
+The full matrix requires Windows SDK, MSVC v145.
 
 This PowerShell snippet finds MSBuild without assuming a Visual Studio edition or install directory:
 
