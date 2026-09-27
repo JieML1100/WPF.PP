@@ -1732,6 +1732,38 @@ bool D2DGraphics::PushTransformedRectangleClip(
 		return false;
 	return PushGeometryClip(transformed.Get());
 }
+bool D2DGraphics::TryPushAxisAlignedRectangleClip(
+	D2D1_RECT_F rect,
+	const D2D1_MATRIX_3X2_F& transform) {
+	auto* ctx = pDeviceContext.Get();
+	if (!ctx || !std::isfinite(rect.left) || !std::isfinite(rect.top)
+		|| !std::isfinite(rect.right) || !std::isfinite(rect.bottom)
+		|| rect.right <= rect.left || rect.bottom <= rect.top
+		|| transform._12 != 0.0f || transform._21 != 0.0f
+		|| !std::isfinite(transform._11) || !std::isfinite(transform._22)
+		|| !std::isfinite(transform._31) || !std::isfinite(transform._32))
+		return false;
+	// PushAxisAlignedClip is exact only while the device transform preserves
+	// axes; otherwise Direct2D would clip to the transformed bounding box.
+	D2D1_MATRIX_3X2_F current{};
+	ctx->GetTransform(&current);
+	if (current._12 != 0.0f || current._21 != 0.0f) return false;
+	const float x0 = rect.left * transform._11 + transform._31;
+	const float x1 = rect.right * transform._11 + transform._31;
+	const float y0 = rect.top * transform._22 + transform._32;
+	const float y1 = rect.bottom * transform._22 + transform._32;
+	const D2D1_RECT_F local{
+		(std::min)(x0, x1), (std::min)(y0, y1),
+		(std::max)(x0, x1), (std::max)(y0, y1) };
+	if (!std::isfinite(local.left) || !std::isfinite(local.top)
+		|| !std::isfinite(local.right) || !std::isfinite(local.bottom))
+		return false;
+	// A rectangle mask in a layer and an axis-aligned clip produce the same
+	// per-primitive antialiased coverage, but the latter needs neither factory
+	// geometry nor an intermediate layer when the command list is replayed.
+	ctx->PushAxisAlignedClip(local, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+	return true;
+}
 void D2DGraphics::PopGeometryClip() {
 	auto* ctx = pDeviceContext.Get();
 	if (!ctx || _geometryClipGeometryStack.empty()) return;
@@ -1867,6 +1899,26 @@ void D2DGraphics::AbortCommandRecording() noexcept {
 void D2DGraphics::DrawCommandList(ID2D1CommandList* commandList) {
 	if (!pDeviceContext || !commandList) return;
 	pDeviceContext->DrawImage(commandList);
+	wicDirty = true;
+}
+
+void D2DGraphics::DrawCommandList(
+	ID2D1CommandList* commandList, D2D1_POINT_2F offset) {
+	if (!pDeviceContext || !commandList) return;
+	if (offset.x == 0.0f && offset.y == 0.0f) {
+		DrawCommandList(commandList);
+		return;
+	}
+	D2D1_MATRIX_3X2_F current{};
+	pDeviceContext->GetTransform(&current);
+	// Command lists carry their recorded world transforms. Displacing the
+	// replay first keeps every recorded clip and primitive rigidly together.
+	pDeviceContext->SetTransform(
+		D2D1::Matrix3x2F::Translation(offset.x, offset.y)
+		* D2D1::Matrix3x2F(current._11, current._12, current._21,
+			current._22, current._31, current._32));
+	pDeviceContext->DrawImage(commandList);
+	pDeviceContext->SetTransform(current);
 	wicDirty = true;
 }
 

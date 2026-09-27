@@ -230,6 +230,15 @@ public:
 	bool PushTransformedRectangleClip(
 		D2D1_RECT_F rect,
 		const D2D1_MATRIX_3X2_F& transform);
+	/**
+	 * Pushes the same rectangle as an axis-aligned clip when both the supplied
+	 * transform and the current device transform preserve axes. Returns false
+	 * without touching the clip stack otherwise; the caller then falls back to
+	 * PushTransformedRectangleClip. A successful push is undone by PopDrawRect.
+	 */
+	bool TryPushAxisAlignedRectangleClip(
+		D2D1_RECT_F rect,
+		const D2D1_MATRIX_3X2_F& transform);
 	void PopGeometryClip();
 	bool PushRoundClip(float left, float top, float width, float height, float radius);
 	void PopRoundClip();
@@ -260,6 +269,8 @@ public:
 	HRESULT EndCommandRecording(ID2D1CommandList** commandList);
 	void AbortCommandRecording() noexcept;
 	void DrawCommandList(ID2D1CommandList* commandList);
+	/** Replays a command list displaced by a render-space translation (DIP). */
+	void DrawCommandList(ID2D1CommandList* commandList, D2D1_POINT_2F offset);
 
 	ID2D1Bitmap1* CreateBitmapFromDxgiSurface(IDXGISurface* surface);
 	void DrawDxgiSurface(IDXGISurface* surface, float x, float y, float width, float height, float opacity = 1.0f);

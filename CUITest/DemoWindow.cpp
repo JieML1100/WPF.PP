@@ -1109,10 +1109,13 @@ namespace
 					16.0f, 146.0f,
 					D2D1::ColorF(0.62f, 0.90f, 0.70f, 1.0f));
 				graphics.DrawString(StringHelper::Format(
-					L"commands · record %llu · replay %llu · hits %llu · invalidated %llu",
+					L"commands · record %llu · replay %llu · hits %llu · moved %llu · kept %llu · invalidated %llu",
 					static_cast<unsigned long long>(stats.CommandRecordedNodes),
 					static_cast<unsigned long long>(stats.CommandReplayedNodes),
 					static_cast<unsigned long long>(stats.CommandCacheHitNodes),
+					static_cast<unsigned long long>(stats.CommandTranslatedNodes),
+					static_cast<unsigned long long>(
+						stats.CommandCacheRetainedNodes),
 					static_cast<unsigned long long>(
 						stats.CommandCacheInvalidatedNodes)),
 					16.0f, 172.0f,

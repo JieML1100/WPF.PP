@@ -2475,6 +2475,7 @@ void Control::BeginRender()
 void Control::BeginRender(float clipW, float clipH)
 {
 	_activeGeometryClipCount = 0;
+	_activeAxisAlignedClipMask = 0;
 	if (!this->GetPresentationWindow() || !this->GetDrawingContext()) return;
 	const float titleBarOffset = static_cast<float>(
 		this->GetPresentationWindow()->GetTitleBarHeightDip());
@@ -2522,8 +2523,22 @@ void Control::BeginRender(float clipW, float clipH)
 			* renderToLocal;
 		if (item.IsChildrenRectangle)
 		{
-			if (this->GetDrawingContext()->PushTransformedRectangleClip(
-				owner->GetVisualChildrenClipRect(), ownerToLocal))
+			// Scrolling hosts and ClipToBounds panels are almost always
+			// axis-aligned. Each layer push here is replayed by every retained
+			// command list, so prefer the cheap exact axis-aligned clip.
+			// Isolated recordings may later be replayed under an animated
+			// non-axis-preserving transform, where only a layer stays exact.
+			const auto childrenClip = owner->GetVisualChildrenClipRect();
+			if (!clipSuppressionRoot && _activeGeometryClipCount < 64u
+				&& this->GetDrawingContext()->TryPushAxisAlignedRectangleClip(
+					childrenClip, ownerToLocal))
+			{
+				_activeAxisAlignedClipMask |=
+					uint64_t{ 1 } << _activeGeometryClipCount;
+				++_activeGeometryClipCount;
+			}
+			else if (this->GetDrawingContext()->PushTransformedRectangleClip(
+				childrenClip, ownerToLocal))
 				++_activeGeometryClipCount;
 			continue;
 		}
@@ -2765,9 +2780,14 @@ void Control::EndRender()
 #endif
 	while (_activeGeometryClipCount > 0)
 	{
-		this->GetDrawingContext()->PopGeometryClip();
 		--_activeGeometryClipCount;
+		const bool axisAligned = _activeGeometryClipCount < 64u
+			&& (_activeAxisAlignedClipMask
+				& (uint64_t{ 1 } << _activeGeometryClipCount)) != 0u;
+		if (axisAligned) this->GetDrawingContext()->PopDrawRect();
+		else this->GetDrawingContext()->PopGeometryClip();
 	}
+	_activeAxisAlignedClipMask = 0;
 	this->GetDrawingContext()->PopLocalTransform();
 	this->_layoutState.CommitPaint();
 	// The previous invalidation is only a coalescing aid while a visual is

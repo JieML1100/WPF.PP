@@ -166,6 +166,10 @@ struct PresentationFrameStatistics
 	size_t CommandRecordedNodes = 0;
 	size_t CommandReplayedNodes = 0;
 	size_t CommandCacheHitNodes = 0;
+	/** Cache hits replayed with a rigid translation instead of re-recording. */
+	size_t CommandTranslatedNodes = 0;
+	/** Command lists carried across a scene topology rebuild. */
+	size_t CommandCacheRetainedNodes = 0;
 	size_t CommandCacheInvalidatedNodes = 0;
 	size_t NativeCommitNodes = 0;
 	size_t CulledNodes = 0;
@@ -203,6 +207,8 @@ protected:
 	std::optional<cui::drawing::Transform> _renderTransform;
 	D2D1_POINT_2F _renderTransformOrigin{ 0.0f, 0.0f };
 	size_t _activeGeometryClipCount = 0;
+	/** Bit i set: ancestor clip i was pushed as an axis-aligned clip. */
+	uint64_t _activeAxisAlignedClipMask = 0;
 	PresentationRevisionSnapshot _presentationRevisions;
 	VisualParentChangedEvent OnVisualParentChanged;
 
