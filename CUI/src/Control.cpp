@@ -1758,6 +1758,67 @@ Control* ControlWeakReference::Get() const noexcept
 		&& lifetime->load(std::memory_order_acquire) ? _target : nullptr;
 }
 
+namespace
+{
+	thread_local size_t PresentationWindowTransferDepth = 0;
+	thread_local std::vector<ControlWeakReference>
+		PendingPresentationWindowTransfers;
+}
+
+/**
+ * Attaching a subtree that kept its Window through a transfer scope. The
+ * subtree already carries the right presentation source, command domain and
+ * layout caches; only route-dependent state of the new ancestors changes.
+ */
+bool Control::CompletePendingPresentationWindowTransfer(
+	Control& child, PresentationWindow* window)
+{
+	auto& pending = PendingPresentationWindowTransfers;
+	const auto found = std::find_if(pending.begin(), pending.end(),
+		[&child](const ControlWeakReference& value)
+		{ return value.Get() == &child; });
+	if (found == pending.end()) return false;
+	pending.erase(found);
+	if (!window || child.GetPresentationWindow() != window) return false;
+	// Same-domain reparenting changes command routes: requery the Window once
+	// instead of once per descendant.
+	(void)RoutedCommandManager::InvalidateRequerySuggested(child);
+	const ControlWeakReference windowLifetime(window);
+	if (auto* live = dynamic_cast<Window*>(windowLifetime.Get()))
+		live->RefreshReverseInheritedInputProperties();
+	return true;
+}
+
+Control::ScopedPresentationWindowTransfer::
+	ScopedPresentationWindowTransfer() noexcept
+{
+	++PresentationWindowTransferDepth;
+}
+
+Control::ScopedPresentationWindowTransfer::
+	~ScopedPresentationWindowTransfer()
+{
+	if (PresentationWindowTransferDepth == 0) return;
+	if (--PresentationWindowTransferDepth != 0) return;
+	auto pending = std::move(PendingPresentationWindowTransfers);
+	PendingPresentationWindowTransfers.clear();
+	for (const auto& reference : pending)
+	{
+		auto* control = reference.Get();
+		// Still detached (or re-attached outside the framework path): release
+		// the Window exactly as an ordinary detach would have.
+		if (!control || control->GetVisualParent()
+			|| !control->GetPresentationWindow()) continue;
+		try
+		{
+			PropagatePresentationWindow(control, nullptr);
+		}
+		catch (...)
+		{
+		}
+	}
+}
+
 void Control::PropagatePresentationWindow(
 	Control* control,
 	PresentationWindow* form)
@@ -2204,7 +2265,13 @@ void Control::SynchronizeVisualChildCollection(
 		if (!child || stillContains(*owner, child)) continue;
 		child->_isWindowRoot = false;
 		if (!child->_visualParent)
-			PropagatePresentationWindow(child, nullptr);
+		{
+			if (PresentationWindowTransferDepth > 0
+				&& child->GetPresentationWindow())
+				PendingPresentationWindowTransfers.emplace_back(child);
+			else
+				PropagatePresentationWindow(child, nullptr);
+		}
 	}
 
 	std::vector<ControlWeakReference> currentReferences;
@@ -2246,7 +2313,9 @@ void Control::SynchronizeVisualChildCollection(
 			|| child->_visualParent != owner
 			|| child->_logicalParent != logicalParent) continue;
 		child->_isWindowRoot = false;
-		PropagatePresentationWindow(child, owner->GetPresentationWindow());
+		if (!CompletePendingPresentationWindowTransfer(
+			*child, owner->GetPresentationWindow()))
+			PropagatePresentationWindow(child, owner->GetPresentationWindow());
 		owner = selfReference.Get();
 		child = childReference.Get();
 		if (!owner) return;
@@ -17482,6 +17551,7 @@ void Control::PublishEffectiveIsEnabledChanges(
 		if (!element || element->IsDestroying()) continue;
 		const bool current = element->IsEffectivelyEnabled();
 		if (current == previousValue) continue;
+		bool publishedThroughProperty = false;
 		if (const auto* metadata = element->GetPropertyMetadata(
 			Control::IsEnabledProperty()))
 		{
@@ -17490,6 +17560,7 @@ void Control::PublishEffectiveIsEnabledChanges(
 			// bindings, triggers and accessibility stay coherent.
 			element->ApplyPropertyMetadataChange(
 				*metadata, BindingValue(previousValue), BindingValue(current));
+			publishedThroughProperty = true;
 		}
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
@@ -17498,7 +17569,13 @@ void Control::PublishEffectiveIsEnabledChanges(
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
 			|| element->IsEffectivelyEnabled() != current) continue;
-		element->RefreshStyleValues(false);
+		// The property notification above already re-resolved every style whose
+		// triggers read IsEnabled (style property-condition subscription). A
+		// second unconditional resolution per descendant is pure overhead when a
+		// large subtree is enabled/disabled at once.
+		if (!publishedThroughProperty
+			|| !element->_stylePropertyConditionConnection.Connected())
+			element->RefreshStyleValues(false);
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
 			|| element->IsEffectivelyEnabled() != current) continue;
@@ -17559,10 +17636,14 @@ void Control::PublishEffectiveIsVisibleChanges(
 		if (!element || element->IsDestroying()) continue;
 		const bool current = element->GetIsVisible();
 		if (current == previousValue) continue;
+		bool publishedThroughProperty = false;
 		if (const auto* metadata = element->GetPropertyMetadata(
 			Control::IsVisibleProperty()))
+		{
 			element->ApplyPropertyMetadataChange(
 				*metadata, BindingValue(previousValue), BindingValue(current));
+			publishedThroughProperty = true;
+		}
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
 			|| element->GetIsVisible() != current) continue;
@@ -17578,11 +17659,21 @@ void Control::PublishEffectiveIsVisibleChanges(
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
 			|| element->GetIsVisible() != current) continue;
-		element->RefreshStyleValues(false);
+		// Showing or hiding a whole page (TabControl parking, Visibility) visits
+		// every descendant. Styles whose triggers read IsVisible were already
+		// refreshed by the property notification above.
+		if (!publishedThroughProperty
+			|| !element->_stylePropertyConditionConnection.Connected())
+			element->RefreshStyleValues(false);
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
 			|| element->GetIsVisible() != current) continue;
-		element->InvalidateVisual();
+		// Effective visibility changes where an element is presented, not what it
+		// draws: real content changes advance the content revision even while the
+		// element is hidden. Queue damage only, so retained drawing commands of a
+		// page that is shown again stay reusable.
+		element->InvalidateVisualRectCore(
+			ToD2DRect(element->GetAbsoluteRectDip()), false);
 		element = elementReference.Get();
 		if (!element || element->IsDestroying()
 			|| element->GetIsVisible() != current || !element->GetPresentationWindow()) continue;

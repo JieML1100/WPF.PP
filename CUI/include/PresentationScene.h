@@ -177,6 +177,35 @@ private:
 		const Control* VisualParent = nullptr;
 	};
 
+	/**
+	 * Command list and revision snapshot of an ordinary node carried across a
+	 * topology rebuild. Dormant entries belong to nodes that left the scene (a
+	 * hidden TabControl page, a collapsed panel) and are adopted with forced
+	 * geometry validation when the same control re-enters under the same parent.
+	 */
+	struct RetainedCommandCache
+	{
+		ControlWeakReference Element;
+		const Control* VisualParent = nullptr;
+		bool Dormant = false;
+		Microsoft::WRL::ComPtr<ID2D1CommandList> DrawingCommands;
+		uint64_t CommandGeneration = 0;
+		PresentationRevisionSnapshot AppliedRevisions{};
+		D2D1_RECT_F RenderedBounds{};
+		bool HasGeometry = false;
+		bool ContentDirty = true;
+		bool GeometryDirty = true;
+		bool CompositionDirty = true;
+		bool TranslationReplayable = false;
+		D2D1_MATRIX_3X2_F RecordedTransform{
+			1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+		D2D1_SIZE_F RecordedRenderSize{};
+		D2D1_SIZE_F RecordedActualSize{};
+		int RecordedTitleBarOffset = 0;
+		D2D1_POINT_2F ReplayOffset{};
+	};
+	static constexpr size_t MaxDormantCommandLists = 32768;
+
 	struct Segment
 	{
 		struct GeometryRasterMember
@@ -291,6 +320,7 @@ private:
 	uint64_t _resourceGeneration = 0;
 	size_t _pendingCommandCacheInvalidations = 0;
 	size_t _pendingCommandCacheRetentions = 0;
+	std::unordered_map<const Control*, RetainedCommandCache> _dormantCommands;
 	uint64_t _preparedRevision = 0;
 	bool _hasPreparedRevision = false;
 	PresentationFrameStatistics _frameStatistics;
