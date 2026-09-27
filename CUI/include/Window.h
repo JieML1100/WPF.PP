@@ -160,6 +160,10 @@ private:
 	void* _animationInputSliceHookContextForTesting = nullptr;
 	std::vector<ControlWeakReference> _activeDeclarativeAnimationControls;
 	std::vector<ControlWeakReference> _retainedNativeAnimationControls;
+	std::vector<ControlWeakReference> _presentationPreparationQueue;
+	std::vector<ControlWeakReference> _presentationPreparationScratch;
+	/** Drains RequestPresentationPreparation; returns true when work ran. */
+	bool RunPresentationPreparation();
 	bool _animationRegistryDegraded = false;
 	bool _contentRenderedRaised = false;
 	CursorKind _currentCursor = CursorKind::Arrow;
@@ -458,6 +462,13 @@ private:
 			: TextCompositionStatistics{};
 	}
 public:
+	/**
+	 * Queues a control whose PreparePresentation may change the visual topology
+	 * (virtualized realization after an interactive scroll). The queue runs at the
+	 * start of the next paint, before damage is collected and before the retained
+	 * scene synchronizes, so the realized children appear in that same frame.
+	 */
+	void RequestPresentationPreparation(Control& control);
 	bool CaptureMouse(class Control* value);
 	bool ReleaseMouseCapture(class Control* expectedOwner = nullptr);
 	class Control* GetMouseCaptured() const noexcept;

@@ -2,6 +2,9 @@
 
 #include "Decorator.h"
 
+#include <array>
+#include <wrl/client.h>
+
 /**
  * WPF-style Border decorator.
  *
@@ -43,4 +46,22 @@ protected:
 private:
 	static const DependencyPropertyMetadataRegistration&
 		BackgroundPropertyMetadataRelation();
+
+public:
+	/**
+	 * One retained device-independent fill geometry. Recycled virtualized rows
+	 * render identically sized chrome every time they re-record; rebuilding the
+	 * same ID2D1PathGeometry through the factory for every cell dominated the
+	 * cost of re-recording a realized DataGrid page.
+	 */
+	struct GeometryCacheSlot final
+	{
+		std::array<float, 25> Key{};
+		bool Valid = false;
+		Microsoft::WRL::ComPtr<ID2D1PathGeometry> Geometry;
+	};
+
+private:
+	GeometryCacheSlot _backgroundGeometryCache;
+	GeometryCacheSlot _borderGeometryCache;
 };

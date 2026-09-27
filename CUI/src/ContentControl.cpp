@@ -278,6 +278,16 @@ ContentControl::ContentControl()
 void ContentControl::OnRender()
 {
 	if (!IsVisible || !GetPresentationWindow() || !GetDrawingContext()) return;
+	// Templated item containers (DataGridCell, ListBoxItem, ...) usually carry a
+	// transparent Background whose chrome is drawn by the template root. Such a
+	// fill contributes no pixels, so skip the whole recording scaffold for it.
+	{
+		const auto background = GetComputedBackgroundBrush();
+		const bool invisible = background.Kind == cui::drawing::BrushKind::None
+			|| (background.Kind == cui::drawing::BrushKind::Solid
+				&& (background.Color.a <= 0.0f || background.Opacity <= 0.0f));
+		if (invisible && TryCompleteEmptyRender()) return;
+	}
 	BeginRender();
 	const auto size = GetActualSizeDip();
 	if (auto* background = CreateBackgroundBrush(

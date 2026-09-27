@@ -278,6 +278,7 @@ ContentPresenter::ContentPresenter()
 void ContentPresenter::OnRender()
 {
 	if (!IsVisible || !GetPresentationWindow() || !GetDrawingContext()) return;
+	if (TryCompleteEmptyRender()) return;
 	BeginRender();
 	EndRender();
 }
